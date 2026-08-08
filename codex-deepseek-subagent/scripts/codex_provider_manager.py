@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure Codex native DeepSeek subagents through official or custom Responses-compatible providers."""
+"""Configure Codex native subagents through official or custom Responses-compatible providers."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 BASE_SCRIPT = Path(__file__).with_name("codex_deepseek.py")
@@ -29,9 +29,8 @@ DEFAULT_PROVIDER = "deepseek"
 DEFAULT_PROVIDER_NAME = "DeepSeek"
 DEFAULT_ROLE = "DeepSeek"
 DEFAULT_EFFORT = "high"
-ALLOWED_EFFORTS = ("low", "high", "max")
 PROFILE_NAME = "provider-profile.json"
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 3
 PROVIDER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ROLE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -44,7 +43,9 @@ class ProviderProfile:
     provider: str = DEFAULT_PROVIDER
     provider_name: str = DEFAULT_PROVIDER_NAME
     role: str = DEFAULT_ROLE
+    role_auto: bool = True
     reasoning_effort: str = DEFAULT_EFFORT
+    reasoning_efforts: tuple[str, ...] | None = None
     multi_agent_version: str = "auto"
     backend: str = "external"
 
@@ -52,7 +53,6 @@ class ProviderProfile:
     def effective_multi_agent_version(self) -> str:
         if self.multi_agent_version in {"v1", "v2"}:
             return self.multi_agent_version
-        # Cross-provider / non-OpenAI backends currently need plaintext v1.
         return "v2" if self.backend == "openai" else "v1"
 
     @property
@@ -63,6 +63,17 @@ class ProviderProfile:
             f"{self.provider}\0{self.base_url}".encode("utf-8")
         ).hexdigest()[:12]
         return f"codex-deepseek-api-key-{digest}"
+
+
+def _validate_plain_value(value: str, label: str, max_bytes: int = 256) -> str:
+    value = value.strip()
+    if not value:
+        raise manager.ManagerError(f"invalid_{label}", f"{label} 不能为空。")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise manager.ManagerError(f"invalid_{label}", f"{label} 不能包含控制字符。")
+    if len(value.encode("utf-8")) > max_bytes:
+        raise manager.ManagerError(f"invalid_{label}", f"{label} 过长。")
+    return value
 
 
 def normalize_base_url(value: str) -> str:
@@ -81,27 +92,87 @@ def normalize_base_url(value: str) -> str:
     return value.rstrip("/") + "/"
 
 
+def normalize_reasoning_effort(value: str) -> str:
+    return _validate_plain_value(value, "reasoning_effort", max_bytes=128)
+
+
+def normalize_reasoning_efforts(
+    values: Iterable[str] | None,
+    selected: str,
+) -> tuple[str, ...] | None:
+    if values is None:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        effort = normalize_reasoning_effort(value)
+        if effort not in seen:
+            normalized.append(effort)
+            seen.add(effort)
+    if selected not in seen:
+        normalized.append(selected)
+    return tuple(normalized)
+
+
+def parse_reasoning_efforts(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    pieces = [item.strip() for item in value.split(",") if item.strip()]
+    if not pieces:
+        raise manager.ManagerError(
+            "invalid_reasoning_efforts",
+            "--reasoning-efforts 至少需要一个非空档位。",
+        )
+    return tuple(pieces)
+
+
+def infer_role(model: str) -> str:
+    lowered = model.lower()
+    known = (
+        ("deepseek", "DeepSeek"),
+        ("luna", "Luna"),
+        ("terra", "Terra"),
+        ("sol", "Sol"),
+        ("kimi", "Kimi"),
+        ("qwen", "Qwen"),
+        ("glm", "GLM"),
+        ("claude", "Claude"),
+        ("gemini", "Gemini"),
+    )
+    for marker, role in known:
+        if marker in lowered:
+            return role
+
+    leaf = model.rsplit("/", 1)[-1]
+    tokens = re.findall(r"[A-Za-z0-9]+", leaf)
+    ignored = {"gpt", "model", "chat", "instruct", "preview", "latest"}
+    for token in reversed(tokens):
+        if token.lower() in ignored or token.isdigit():
+            continue
+        candidate = token if token.isupper() else token.capitalize()
+        if ROLE_RE.fullmatch(candidate):
+            return candidate
+    return "CustomAgent"
+
+
 def validate_profile(profile: ProviderProfile) -> ProviderProfile:
     if profile.mode not in {"official", "custom"}:
         raise manager.ManagerError("invalid_profile", "mode 只能是 official 或 custom。")
-    if not profile.model.strip():
-        raise manager.ManagerError("invalid_model", "model 不能为空。")
-    if not PROVIDER_RE.fullmatch(profile.provider):
+    model = _validate_plain_value(profile.model, "model")
+    provider = profile.provider.strip()
+    if not PROVIDER_RE.fullmatch(provider):
         raise manager.ManagerError(
             "invalid_provider",
             "provider 只能包含字母、数字、下划线和连字符。",
         )
-    if not ROLE_RE.fullmatch(profile.role):
+    role = profile.role.strip()
+    if not ROLE_RE.fullmatch(role):
         raise manager.ManagerError(
             "invalid_role",
             "role 只能包含字母、数字、下划线和连字符。",
         )
-    effort = profile.reasoning_effort.strip() or DEFAULT_EFFORT
-    if effort not in ALLOWED_EFFORTS:
-        raise manager.ManagerError(
-            "invalid_reasoning_effort",
-            f"reasoning effort 只能是 {', '.join(ALLOWED_EFFORTS)}。",
-        )
+    effort = normalize_reasoning_effort(profile.reasoning_effort)
+    efforts = normalize_reasoning_efforts(profile.reasoning_efforts, effort)
     if profile.multi_agent_version not in {"auto", "v1", "v2"}:
         raise manager.ManagerError(
             "invalid_multi_agent_version",
@@ -116,11 +187,12 @@ def validate_profile(profile: ProviderProfile) -> ProviderProfile:
         **{
             **asdict(profile),
             "base_url": normalize_base_url(profile.base_url),
-            "model": profile.model.strip(),
-            "provider": profile.provider.strip(),
-            "provider_name": profile.provider_name.strip() or profile.provider,
-            "role": profile.role.strip(),
+            "model": model,
+            "provider": provider,
+            "provider_name": profile.provider_name.strip() or provider,
+            "role": role,
             "reasoning_effort": effort,
+            "reasoning_efforts": efforts,
         }
     )
 
@@ -142,7 +214,7 @@ def load_profile(paths: Any) -> ProviderProfile:
         ) from exc
 
     schema = payload.get("schema_version")
-    if schema not in {1, PROFILE_SCHEMA_VERSION}:
+    if schema not in {1, 2, PROFILE_SCHEMA_VERSION}:
         raise manager.ManagerError(
             "unsupported_profile",
             f"不支持的 Provider profile schema：{schema}",
@@ -150,6 +222,10 @@ def load_profile(paths: Any) -> ProviderProfile:
     raw = payload.get("profile")
     if not isinstance(raw, dict):
         raise manager.ManagerError("invalid_profile", "Provider profile 缺少 profile 对象。")
+    raw = dict(raw)
+    raw.setdefault("reasoning_efforts", None)
+    if "role_auto" not in raw:
+        raw["role_auto"] = raw.get("role") == infer_role(str(raw.get("model", OFFICIAL_MODEL)))
     try:
         return validate_profile(ProviderProfile(**raw))
     except TypeError as exc:
@@ -171,7 +247,37 @@ def remove_profile(paths: Any) -> None:
 
 def profile_from_args(args: argparse.Namespace, paths: Any) -> tuple[ProviderProfile, bool]:
     existing = load_profile(paths)
-    names = (
+    has_profile = profile_path(paths).is_file()
+    override_names = (
+        "base_url",
+        "model",
+        "provider",
+        "provider_name",
+        "role",
+        "reasoning_effort",
+        "reasoning_efforts",
+        "multi_agent_version",
+        "backend",
+    )
+    has_override = any(getattr(args, name, None) is not None for name in override_names) or bool(
+        getattr(args, "official", False)
+    )
+    if not has_override:
+        return existing, False
+
+    if args.official:
+        if any(getattr(args, name, None) is not None for name in override_names):
+            raise manager.ManagerError(
+                "invalid_profile",
+                "--official 不能与自定义 Provider 参数同时使用。",
+            )
+        return ProviderProfile(), True
+
+    base = existing if has_profile else ProviderProfile(mode="custom")
+    values = asdict(base)
+    old_model = values["model"]
+
+    for field in (
         "base_url",
         "model",
         "provider",
@@ -179,29 +285,23 @@ def profile_from_args(args: argparse.Namespace, paths: Any) -> tuple[ProviderPro
         "reasoning_effort",
         "multi_agent_version",
         "backend",
-    )
-    has_override = any(getattr(args, name, None) is not None for name in names) or bool(
-        getattr(args, "official", False)
-    )
-    if not has_override:
-        return existing, False
-
-    if args.official:
-        if any(getattr(args, name, None) is not None for name in names):
-            raise manager.ManagerError(
-                "invalid_profile",
-                "--official 不能与自定义 Provider 参数同时使用。",
-            )
-        return ProviderProfile(), True
-
-    base = ProviderProfile() if not profile_path(paths).is_file() else existing
-    values = asdict(base)
-    for field in names:
+    ):
         value = getattr(args, field, None)
         if value is not None:
             values[field] = value
 
-    normalized_url = normalize_base_url(values["base_url"])
+    if args.reasoning_efforts is not None:
+        values["reasoning_efforts"] = parse_reasoning_efforts(args.reasoning_efforts)
+
+    explicit_role = args.role is not None
+    if explicit_role:
+        values["role"] = args.role
+        values["role_auto"] = False
+    elif not has_profile or (values.get("role_auto", True) and values["model"] != old_model):
+        values["role"] = infer_role(str(values["model"]))
+        values["role_auto"] = True
+
+    normalized_url = normalize_base_url(str(values["base_url"]))
     values["base_url"] = normalized_url
     values["mode"] = (
         "official"
@@ -210,6 +310,9 @@ def profile_from_args(args: argparse.Namespace, paths: Any) -> tuple[ProviderPro
         and values["provider"] == DEFAULT_PROVIDER
         else "custom"
     )
+    if values["mode"] == "official" and not explicit_role and not has_profile:
+        values["role"] = DEFAULT_ROLE
+        values["role_auto"] = True
     return validate_profile(ProviderProfile(**values)), True
 
 
@@ -221,6 +324,47 @@ def _recursive_model_alias(value: Any, model: str) -> Any:
     if isinstance(value, str) and value == OFFICIAL_MODEL:
         return model
     return value
+
+
+def _catalog_efforts(model: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for item in model.get("supported_reasoning_levels", []) or []:
+        if isinstance(item, dict) and isinstance(item.get("effort"), str):
+            values.append(item["effort"])
+    return values
+
+
+def _patch_catalog_reasoning(
+    model: dict[str, Any],
+    profile: ProviderProfile,
+    preserve_existing: bool,
+) -> dict[str, Any]:
+    result = copy.deepcopy(model)
+    existing_items = result.get("supported_reasoning_levels", []) or []
+    descriptions = {
+        item.get("effort"): item.get("description")
+        for item in existing_items
+        if isinstance(item, dict) and isinstance(item.get("effort"), str)
+    }
+
+    if profile.reasoning_efforts is not None:
+        efforts = list(profile.reasoning_efforts)
+    elif preserve_existing and _catalog_efforts(result):
+        efforts = _catalog_efforts(result)
+        if profile.reasoning_effort not in efforts:
+            efforts.append(profile.reasoning_effort)
+    else:
+        efforts = [profile.reasoning_effort]
+
+    result["default_reasoning_level"] = profile.reasoning_effort
+    result["supported_reasoning_levels"] = [
+        {
+            "effort": effort,
+            "description": descriptions.get(effort) or f"{effort} reasoning effort",
+        }
+        for effort in efforts
+    ]
+    return result
 
 
 def apply_profile(profile: ProviderProfile) -> None:
@@ -236,13 +380,14 @@ def apply_profile(profile: ProviderProfile) -> None:
     manager.DESKTOP_MULTI_AGENT_V2 = profile.effective_multi_agent_version == "v2"
 
     def expected_agent_text() -> str:
-        return f'''name = "{profile.role}"
-description = "Text-only DeepSeek subagent for coding, repository research, review, and verification. Do not use it for image, video, screenshot, or other visual inspection; the parent agent must inspect visual inputs and pass the findings as text."
-model = "{profile.model}"
-model_provider = "{profile.provider}"
-model_reasoning_effort = "{profile.reasoning_effort}"
+        q = manager.toml_string
+        return f'''name = {q(profile.role)}
+description = {q(f"Text-only {profile.role} subagent for coding, repository research, review, and verification. Visual inputs must be converted to text by the parent agent.")}
+model = {q(profile.model)}
+model_provider = {q(profile.provider)}
+model_reasoning_effort = {q(profile.reasoning_effort)}
 developer_instructions = """
-You are a focused DeepSeek subagent running inside Codex.
+You are a focused subagent running inside Codex through the configured provider.
 
 Complete the bounded task assigned by the parent agent, use available tools when needed, and return a concise evidence-based result.
 You are text-only. Do not claim to inspect images, videos, screenshots, or other visual inputs. If visual evidence is required and the parent did not provide a textual description, report that limitation clearly.
@@ -290,13 +435,44 @@ refresh_interval_ms = 0
                 issues.append(f"model_providers.{profile.provider}.auth.{key}")
         return issues
 
-    def fetch_model_template() -> dict[str, Any]:
-        model = copy.deepcopy(original_fetch_model())
-        if profile.model == OFFICIAL_MODEL:
-            return model
-        model = _recursive_model_alias(model, profile.model)
-        model["slug"] = profile.model
-        return model
+    def fetch_model_placeholder() -> dict[str, Any]:
+        return {"slug": profile.model, "_provider_manager_placeholder": True}
+
+    def merged_catalog(
+        base: dict[str, Any],
+        _placeholder: dict[str, Any],
+        parent_model: str,
+    ) -> dict[str, Any]:
+        models = copy.deepcopy(base.get("models", []))
+        existing = next(
+            (item for item in models if item.get("slug") == profile.model),
+            None,
+        )
+        if existing is not None:
+            child_model = _patch_catalog_reasoning(existing, profile, preserve_existing=True)
+        else:
+            template = copy.deepcopy(original_fetch_model())
+            child_model = _recursive_model_alias(template, profile.model)
+            child_model["slug"] = profile.model
+            if "display_name" in child_model:
+                child_model["display_name"] = profile.role
+            if "description" in child_model:
+                child_model["description"] = f"{profile.model} via {profile.provider_name}"
+            child_model = _patch_catalog_reasoning(child_model, profile, preserve_existing=False)
+
+        models = [item for item in models if item.get("slug") != profile.model]
+        models.append(child_model)
+
+        parent_found = False
+        for model in models:
+            if model.get("slug") == parent_model:
+                model["multi_agent_version"] = manager.PARENT_MULTI_AGENT_VERSION
+                parent_found = True
+                break
+        if not parent_found:
+            raise manager.ManagerError("parent_model_missing", f"模型目录中没有父模型 {parent_model}。")
+        models.sort(key=lambda item: item.get("slug", ""))
+        return {"models": models}
 
     def store_credential_key(secret: str) -> None:
         secret = secret.strip()
@@ -349,7 +525,7 @@ refresh_interval_ms = 0
         if proc.returncode != 0 or "DEEPSEEK_DIRECT_OK" not in proc.stdout:
             raise manager.ManagerError(
                 "direct_test_failed",
-                "DeepSeek/自定义 Provider 直连测试失败。",
+                "自定义 Provider 直连测试失败。",
                 {"stderr": proc.stderr[-1000:]},
             )
         return {"direct": True}
@@ -357,9 +533,41 @@ refresh_interval_ms = 0
     manager.expected_agent_text = expected_agent_text
     manager.managed_provider_block = managed_provider_block
     manager.provider_conflicts = provider_conflicts
-    manager.fetch_official_deepseek_model = fetch_model_template
+    manager.fetch_official_deepseek_model = fetch_model_placeholder
+    manager.merged_catalog = merged_catalog
     manager.store_credential_key = store_credential_key
     manager.direct_test = direct_test
+
+
+def cleanup_replaced_role(
+    home: Path,
+    old_profile: ProviderProfile,
+    new_profile: ProviderProfile,
+    old_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    if old_profile.role == new_profile.role:
+        return {}
+    old_agent = home / "agents" / f"{old_profile.role}.toml"
+    if not old_agent.is_file():
+        return {"previous_role": old_profile.role, "old_agent_removed": False}
+    expected_hash = old_manifest.get("agent_sha256")
+    if old_manifest.get("managed_agent_file") and expected_hash:
+        try:
+            current_hash = manager.sha256_text_file(old_agent)
+        except OSError:
+            current_hash = None
+        if current_hash == expected_hash:
+            old_agent.unlink()
+            return {
+                "previous_role": old_profile.role,
+                "old_agent_removed": True,
+                "old_agent_path": str(old_agent),
+            }
+    return {
+        "previous_role": old_profile.role,
+        "old_agent_removed": False,
+        "old_agent_preserved": str(old_agent),
+    }
 
 
 def enrich(payload: dict[str, Any], profile: ProviderProfile) -> dict[str, Any]:
@@ -371,7 +579,9 @@ def enrich(payload: dict[str, Any], profile: ProviderProfile) -> dict[str, Any]:
         "base_url": profile.base_url,
         "model": profile.model,
         "role": profile.role,
+        "role_auto": profile.role_auto,
         "reasoning_effort": profile.reasoning_effort,
+        "reasoning_efforts": list(profile.reasoning_efforts) if profile.reasoning_efforts else None,
         "multi_agent_version": profile.multi_agent_version,
         "effective_multi_agent_version": profile.effective_multi_agent_version,
         "backend": profile.backend,
@@ -379,14 +589,18 @@ def enrich(payload: dict[str, Any], profile: ProviderProfile) -> dict[str, Any]:
         "resume_policy": "fresh-spawn-handoff",
         "credential_target": profile.credential_target,
     }
-    warnings: list[str] = []
+    warnings = list(result.get("warnings") or [])
     if profile.multi_agent_version == "v2" and profile.backend == "external":
         warnings.append(
             "已强制启用 multi-agent v2，但第三方/跨 Provider 后端可能无法消费 OpenAI 专有的加密 agent_message；子 Agent 收不到任务时请切回 auto 或 v1。"
         )
     warnings.append(
-        "当前 Codex 的 resume_agent 可能恢复历史但丢失自定义子 Agent 的原 model/provider/reasoning 配置；第三方 DeepSeek 线程建议 fresh spawn，并把上一子 Agent 的 handoff 作为上下文传入。"
+        "当前 Codex 的 resume_agent 可能恢复历史但丢失自定义子 Agent 的原 model/provider/reasoning 配置；第三方线程建议 fresh spawn，并把上一子 Agent 的 handoff 作为上下文传入。"
     )
+    if result.get("old_agent_preserved"):
+        warnings.append(
+            f"旧角色文件已被修改或无法确认由本 Skill 管理，因此保留：{result['old_agent_preserved']}"
+        )
     result["warnings"] = warnings
     return result
 
@@ -410,7 +624,15 @@ def build_parser() -> argparse.ArgumentParser:
     provider.add_argument("--model")
     provider.add_argument("--provider")
     provider.add_argument("--provider-name")
-    provider.add_argument("--reasoning-effort", choices=ALLOWED_EFFORTS)
+    provider.add_argument("--role", "--agent-name", dest="role")
+    provider.add_argument(
+        "--reasoning-effort",
+        help="当前使用的 reasoning effort；支持 Codex 已知值和模型自定义的任意非空字符串。",
+    )
+    provider.add_argument(
+        "--reasoning-efforts",
+        help="可选：逗号分隔的模型支持档位，用于写入模型目录，例如 low,medium,high,xhigh。",
+    )
     provider.add_argument(
         "--multi-agent-version",
         choices=("auto", "v1", "v2"),
@@ -425,16 +647,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    paths = manager.resolve_paths(args.codex_home)
+    bootstrap_paths = manager.resolve_paths(args.codex_home)
 
     try:
-        profile, overridden = profile_from_args(args, paths)
+        old_profile_present = profile_path(bootstrap_paths).is_file()
+        old_profile = load_profile(bootstrap_paths)
+        old_manifest = manager.read_manifest(bootstrap_paths)
+        profile, overridden = profile_from_args(args, bootstrap_paths)
         if args.command not in {"setup", "repair"} and overridden:
             raise manager.ManagerError(
                 "profile_override_not_allowed",
                 "Provider 参数只允许在 setup 或 repair 时修改。",
             )
+
         apply_profile(profile)
+        paths = manager.resolve_paths(args.codex_home)
 
         if args.command == "profile":
             payload = manager.result("profile", profile=asdict(profile))
@@ -489,6 +716,15 @@ def main() -> int:
                         "failed",
                     }:
                         save_profile(paths, profile)
+                        if old_profile_present:
+                            payload.update(
+                                cleanup_replaced_role(
+                                    paths.home,
+                                    old_profile,
+                                    profile,
+                                    old_manifest,
+                                )
+                            )
                 elif args.command == "test":
                     payload = manager.run_tests(paths, codex_bin or "")
                 elif args.command == "disable":
