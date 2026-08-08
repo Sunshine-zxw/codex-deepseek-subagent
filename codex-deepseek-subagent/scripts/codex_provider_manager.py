@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure Codex native subagents through DeepSeek official or custom Responses-compatible providers."""
+"""Configure Codex native DeepSeek subagents through official or custom Responses-compatible providers."""
 
 from __future__ import annotations
 
@@ -29,8 +29,9 @@ DEFAULT_PROVIDER = "deepseek"
 DEFAULT_PROVIDER_NAME = "DeepSeek"
 DEFAULT_ROLE = "DeepSeek"
 DEFAULT_EFFORT = "high"
+ALLOWED_EFFORTS = ("low", "high", "max")
 PROFILE_NAME = "provider-profile.json"
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 PROVIDER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ROLE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -51,6 +52,7 @@ class ProviderProfile:
     def effective_multi_agent_version(self) -> str:
         if self.multi_agent_version in {"v1", "v2"}:
             return self.multi_agent_version
+        # Cross-provider / non-OpenAI backends currently need plaintext v1.
         return "v2" if self.backend == "openai" else "v1"
 
     @property
@@ -94,6 +96,12 @@ def validate_profile(profile: ProviderProfile) -> ProviderProfile:
             "invalid_role",
             "role 只能包含字母、数字、下划线和连字符。",
         )
+    effort = profile.reasoning_effort.strip() or DEFAULT_EFFORT
+    if effort not in ALLOWED_EFFORTS:
+        raise manager.ManagerError(
+            "invalid_reasoning_effort",
+            f"reasoning effort 只能是 {', '.join(ALLOWED_EFFORTS)}。",
+        )
     if profile.multi_agent_version not in {"auto", "v1", "v2"}:
         raise manager.ManagerError(
             "invalid_multi_agent_version",
@@ -112,7 +120,7 @@ def validate_profile(profile: ProviderProfile) -> ProviderProfile:
             "provider": profile.provider.strip(),
             "provider_name": profile.provider_name.strip() or profile.provider,
             "role": profile.role.strip(),
-            "reasoning_effort": profile.reasoning_effort.strip() or DEFAULT_EFFORT,
+            "reasoning_effort": effort,
         }
     )
 
@@ -132,10 +140,12 @@ def load_profile(paths: Any) -> ProviderProfile:
             "invalid_profile",
             f"无法读取 Provider profile：{path}",
         ) from exc
-    if payload.get("schema_version") != PROFILE_SCHEMA_VERSION:
+
+    schema = payload.get("schema_version")
+    if schema not in {1, PROFILE_SCHEMA_VERSION}:
         raise manager.ManagerError(
             "unsupported_profile",
-            f"不支持的 Provider profile schema：{payload.get('schema_version')}",
+            f"不支持的 Provider profile schema：{schema}",
         )
     raw = payload.get("profile")
     if not isinstance(raw, dict):
@@ -161,61 +171,36 @@ def remove_profile(paths: Any) -> None:
 
 def profile_from_args(args: argparse.Namespace, paths: Any) -> tuple[ProviderProfile, bool]:
     existing = load_profile(paths)
-    has_override = any(
-        getattr(args, name, None) is not None
-        for name in (
-            "base_url",
-            "model",
-            "provider",
-            "provider_name",
-            "reasoning_effort",
-            "multi_agent_version",
-            "backend",
-        )
-    ) or bool(getattr(args, "official", False))
+    names = (
+        "base_url",
+        "model",
+        "provider",
+        "provider_name",
+        "reasoning_effort",
+        "multi_agent_version",
+        "backend",
+    )
+    has_override = any(getattr(args, name, None) is not None for name in names) or bool(
+        getattr(args, "official", False)
+    )
     if not has_override:
         return existing, False
 
     if args.official:
-        conflicting = any(
-            getattr(args, name, None) is not None
-            for name in (
-                "base_url",
-                "model",
-                "provider",
-                "provider_name",
-                "reasoning_effort",
-                "multi_agent_version",
-                "backend",
-            )
-        )
-        if conflicting:
+        if any(getattr(args, name, None) is not None for name in names):
             raise manager.ManagerError(
                 "invalid_profile",
                 "--official 不能与自定义 Provider 参数同时使用。",
             )
         return ProviderProfile(), True
 
-    if args.command == "setup" and not profile_path(paths).is_file():
-        base = ProviderProfile(mode="custom")
-    else:
-        base = existing
-
+    base = ProviderProfile() if not profile_path(paths).is_file() else existing
     values = asdict(base)
-    if args.base_url is not None:
-        values["base_url"] = args.base_url
-    if args.model is not None:
-        values["model"] = args.model
-    for field in (
-        "provider",
-        "provider_name",
-        "reasoning_effort",
-        "multi_agent_version",
-        "backend",
-    ):
+    for field in names:
         value = getattr(args, field, None)
         if value is not None:
             values[field] = value
+
     normalized_url = normalize_base_url(values["base_url"])
     values["base_url"] = normalized_url
     values["mode"] = (
@@ -225,8 +210,7 @@ def profile_from_args(args: argparse.Namespace, paths: Any) -> tuple[ProviderPro
         and values["provider"] == DEFAULT_PROVIDER
         else "custom"
     )
-    profile = validate_profile(ProviderProfile(**values))
-    return profile, True
+    return validate_profile(ProviderProfile(**values)), True
 
 
 def _recursive_model_alias(value: Any, model: str) -> Any:
@@ -251,10 +235,26 @@ def apply_profile(profile: ProviderProfile) -> None:
     manager.PARENT_MULTI_AGENT_VERSION = profile.effective_multi_agent_version
     manager.DESKTOP_MULTI_AGENT_V2 = profile.effective_multi_agent_version == "v2"
 
+    def expected_agent_text() -> str:
+        return f'''name = "{profile.role}"
+description = "Text-only DeepSeek subagent for coding, repository research, review, and verification. Do not use it for image, video, screenshot, or other visual inspection; the parent agent must inspect visual inputs and pass the findings as text."
+model = "{profile.model}"
+model_provider = "{profile.provider}"
+model_reasoning_effort = "{profile.reasoning_effort}"
+developer_instructions = """
+You are a focused DeepSeek subagent running inside Codex.
+
+Complete the bounded task assigned by the parent agent, use available tools when needed, and return a concise evidence-based result.
+You are text-only. Do not claim to inspect images, videos, screenshots, or other visual inputs. If visual evidence is required and the parent did not provide a textual description, report that limitation clearly.
+Do not spawn additional subagents unless the user or parent explicitly asks for nested delegation.
+Before finishing a task that may need continuation, include a compact handoff containing completed work, remaining work, relevant files/symbols, and blockers. The parent may need to spawn a fresh replacement agent instead of resuming this thread because current Codex versions can lose custom model/provider settings during resume_agent.
+"""
+'''
+
     def managed_provider_block() -> str:
         auth = manager.expected_provider_auth()
         provider = profile.provider
-        return f"""
+        return f'''
 {manager.PROVIDER_BEGIN}
 [model_providers.{provider}]
 name = {manager.toml_string(profile.provider_name)}
@@ -267,7 +267,7 @@ args = {manager.toml_string_array(auth["args"])}
 timeout_ms = 5000
 refresh_interval_ms = 0
 {manager.PROVIDER_END}
-"""
+'''
 
     def provider_conflicts(provider_config: dict[str, Any] | None) -> list[str]:
         if not provider_config:
@@ -318,10 +318,48 @@ refresh_interval_ms = 0
             "当前只支持 macOS 和 Windows 系统凭据库。",
         )
 
+    def direct_test(paths: Any, codex_bin: str) -> dict[str, Any]:
+        env = dict(manager.os.environ)
+        env["CODEX_HOME"] = str(paths.home)
+        prompt = "Reply exactly DEEPSEEK_DIRECT_OK and nothing else."
+        proc = manager.subprocess.run(
+            [
+                codex_bin,
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--json",
+                "-s",
+                "read-only",
+                "-C",
+                str(paths.home),
+                "-m",
+                profile.model,
+                "-c",
+                f'model_provider={manager.toml_string(profile.provider)}',
+                "-c",
+                f'model_reasoning_effort={manager.toml_string(profile.reasoning_effort)}',
+                prompt,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=180,
+        )
+        if proc.returncode != 0 or "DEEPSEEK_DIRECT_OK" not in proc.stdout:
+            raise manager.ManagerError(
+                "direct_test_failed",
+                "DeepSeek/自定义 Provider 直连测试失败。",
+                {"stderr": proc.stderr[-1000:]},
+            )
+        return {"direct": True}
+
+    manager.expected_agent_text = expected_agent_text
     manager.managed_provider_block = managed_provider_block
     manager.provider_conflicts = provider_conflicts
     manager.fetch_official_deepseek_model = fetch_model_template
     manager.store_credential_key = store_credential_key
+    manager.direct_test = direct_test
 
 
 def enrich(payload: dict[str, Any], profile: ProviderProfile) -> dict[str, Any]:
@@ -338,17 +376,22 @@ def enrich(payload: dict[str, Any], profile: ProviderProfile) -> dict[str, Any]:
         "effective_multi_agent_version": profile.effective_multi_agent_version,
         "backend": profile.backend,
         "wire_api": "responses",
+        "resume_policy": "fresh-spawn-handoff",
         "credential_target": profile.credential_target,
     }
+    warnings: list[str] = []
     if profile.multi_agent_version == "v2" and profile.backend == "external":
-        result["warning"] = (
-            "已强制启用 multi-agent v2，但第三方/跨 Provider 后端可能无法消费 "
-            "OpenAI 专有的加密 agent_message。出现子 Agent 收不到任务时请切回 auto 或 v1。"
+        warnings.append(
+            "已强制启用 multi-agent v2，但第三方/跨 Provider 后端可能无法消费 OpenAI 专有的加密 agent_message；子 Agent 收不到任务时请切回 auto 或 v1。"
         )
+    warnings.append(
+        "当前 Codex 的 resume_agent 可能恢复历史但丢失自定义子 Agent 的原 model/provider/reasoning 配置；第三方 DeepSeek 线程建议 fresh spawn，并把上一子 Agent 的 handoff 作为上下文传入。"
+    )
+    result["warnings"] = warnings
     return result
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
@@ -367,7 +410,7 @@ def main() -> int:
     provider.add_argument("--model")
     provider.add_argument("--provider")
     provider.add_argument("--provider-name")
-    provider.add_argument("--reasoning-effort")
+    provider.add_argument("--reasoning-effort", choices=ALLOWED_EFFORTS)
     provider.add_argument(
         "--multi-agent-version",
         choices=("auto", "v1", "v2"),
@@ -377,8 +420,11 @@ def main() -> int:
         choices=("external", "openai"),
         help="auto 路由判断：external 默认 v1；openai 默认 v2。",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def main() -> int:
+    args = build_parser().parse_args()
     paths = manager.resolve_paths(args.codex_home)
 
     try:
@@ -401,7 +447,8 @@ def main() -> int:
             else None
         )
 
-        with manager.operation_lock(paths) if args.command != "status" else _nullcontext():
+        context = manager.operation_lock(paths) if args.command != "status" else _NullContext()
+        with context:
             old_secret: str | None = None
             replacing_secret = False
             if args.replace_api_key_stdin:
@@ -461,11 +508,11 @@ def main() -> int:
         manager.emit(payload, args.json)
         return 0 if payload["status"] not in {"partial", "credential_missing"} else 2
     except manager.ManagerError as exc:
-        manager.emit(
-            manager.result(exc.code, message=str(exc), **exc.details),
-            args.json,
-        )
+        manager.emit(manager.result(exc.code, message=str(exc), **exc.details), args.json)
         return 2
+    except manager.subprocess.TimeoutExpired:
+        manager.emit(manager.result("timeout", message="操作超时，未输出任何凭据。"), args.json)
+        return 3
     except Exception as exc:
         manager.emit(
             manager.result("failed", message=f"{type(exc).__name__}: {exc}"),
@@ -474,7 +521,7 @@ def main() -> int:
         return 1
 
 
-class _nullcontext:
+class _NullContext:
     def __enter__(self):
         return None
 
