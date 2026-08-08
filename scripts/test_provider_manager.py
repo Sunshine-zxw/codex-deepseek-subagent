@@ -57,6 +57,11 @@ class ProviderManagerTests(unittest.TestCase):
             module.normalize_base_url("https://user:pass@relay.example/v1")
         self.assertEqual(raised.exception.code, "invalid_base_url")
 
+    def test_base_url_rejects_query_string(self) -> None:
+        with self.assertRaises(module.manager.ManagerError) as raised:
+            module.normalize_base_url("https://relay.example/v1?route=deepseek")
+        self.assertEqual(raised.exception.code, "invalid_base_url")
+
     def test_reasoning_effort_supports_low_high_max(self) -> None:
         for effort in module.ALLOWED_EFFORTS:
             with self.subTest(effort=effort):
