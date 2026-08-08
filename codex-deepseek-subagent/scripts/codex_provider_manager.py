@@ -73,10 +73,10 @@ def normalize_base_url(value: str) -> str:
             "invalid_base_url",
             "base URL 必须是有效的 http:// 或 https:// 地址。",
         )
-    if parsed.username or parsed.password or parsed.fragment:
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise manager.ManagerError(
             "invalid_base_url",
-            "base URL 不应包含用户名、密码或 URL fragment。",
+            "base URL 不应包含用户名、密码、query string 或 URL fragment。",
         )
     return value.rstrip("/") + "/"
 
