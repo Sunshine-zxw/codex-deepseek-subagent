@@ -2,287 +2,464 @@
 
 ## 支持范围
 
-- macOS
-- Windows
-- Python 3.11+
-- ChatGPT/Codex 桌面应用至少启动过一次
-- DeepSeek 官方 API，或 OpenAI Responses wire API 兼容的第三方 API / 中转站
-- 默认模型 `deepseek-v4-flash`，也允许中转站使用自定义模型 ID
-- reasoning effort：`low` / `high` / `max`
-- multi-agent：`auto` / `v1` / `v2`
+- macOS；
+- Windows；
+- Python 3.11+；
+- ChatGPT/Codex 桌面应用至少启动过一次；
+- DeepSeek 官方 API；
+- OpenAI Responses wire API 兼容的第三方 API / 中转站；
+- 默认模型 `deepseek-v4-flash`；
+- 自定义模型 ID，例如 `gpt-5.6-luna`；
+- 自动或自定义子 Agent 角色名；
+- 任意非空 reasoning effort；
+- 可选的自定义 reasoning 档位集合；
+- multi-agent `auto` / `v1` / `v2`。
 
-只有 `/chat/completions` 兼容并不足以保证能作为 Codex 原生子 Agent。本项目最终以 Codex 内置运行时的直连测试和真实 `spawn_agent` 验收为准。
+Provider 仅支持 `/chat/completions` 不属于可验证的 Codex 原生子 Agent 兼容范围。
+
+## Codex 对 ReasoningEffort 的当前行为
+
+当前 Codex 源码中的 `ReasoningEffort` 已知值包括：
+
+```text
+none
+minimal
+low
+medium
+high
+xhigh
+max
+ultra
+```
+
+同时还存在：
+
+```text
+Custom(String)
+```
+
+未知但非空的字符串会作为模型自定义 effort 保留下来，而不是被客户端强制限制为固定枚举。
+
+因此本 fork 不再人为限制 `low/high/max`。
+
+管理器只做基础安全校验：
+
+- 非空；
+- 去除首尾空白；
+- 不允许控制字符；
+- 限制异常超长输入。
+
+是否真的被目标 Provider / 模型接受，最终由真实 `codex exec` 和原生子 Agent 验收决定。
+
+相关上游实现位于：
+
+```text
+openai/codex/codex-rs/protocol/src/openai_models.rs
+```
 
 ## 配置位置
 
-默认 `CODEX_HOME` 为 `~/.codex`：
-
-- Codex 配置：`$CODEX_HOME/config.toml`
-- 合并模型目录：`$CODEX_HOME/models-with-deepseek.json`
-- 自定义角色：`$CODEX_HOME/agents/DeepSeek.toml`
-- Provider profile：`$CODEX_HOME/codex-deepseek-subagent/provider-profile.json`
-- 管理状态与备份：`$CODEX_HOME/codex-deepseek-subagent/`
-- 系统凭据：
-  - 官方 DeepSeek：`codex-deepseek-api-key`
-  - 自定义 Provider：根据 `provider + base_url` 生成独立凭据目标
-  - macOS：Keychain
-  - Windows：Credential Manager
-
-程序不修改顶层 `model` 或顶层 `model_provider`，主任务仍使用用户原来的模型和 ChatGPT/Codex 登录方式。
-
-## 两层管理器
-
-本 fork 保留上游：
+默认 `CODEX_HOME`：
 
 ```text
-scripts/codex_deepseek.py
+~/.codex
 ```
 
-作为事务、备份、模型目录、系统凭据、桌面运行时与 SQLite 路由验收的稳定底座。
-
-推荐入口是：
+主要文件：
 
 ```text
-scripts/codex_provider_manager.py
+$CODEX_HOME/config.toml
+$CODEX_HOME/models-with-deepseek.json
+$CODEX_HOME/agents/<Role>.toml
+$CODEX_HOME/codex-deepseek-subagent/manifest.json
+$CODEX_HOME/codex-deepseek-subagent/provider-profile.json
+$CODEX_HOME/codex-deepseek-subagent/backups/
 ```
 
-它会在运行前加载当前 Provider profile，并把模型、Provider、base URL、reasoning effort 和 multi-agent 策略注入底座。这样可以尽量少改上游核心逻辑，降低以后同步上游时的冲突。
+`models-with-deepseek.json` 名称为了兼容原项目继续保留，但内容现在可以包含非 DeepSeek 的自定义子 Agent 模型。
 
-## Provider profile
+程序不修改顶层 `model` 或顶层 `model_provider`，主任务继续使用用户原来的 Codex 模型与登录方式。
 
-profile 持久化以下字段：
+## 动态角色
 
-```json
-{
-  "mode": "custom",
-  "base_url": "https://example.com/v1/",
-  "model": "deepseek-v4-flash",
-  "provider": "deepseek_proxy",
-  "provider_name": "DeepSeek Proxy",
-  "role": "DeepSeek",
-  "reasoning_effort": "high",
-  "multi_agent_version": "auto",
-  "backend": "external"
-}
-```
+角色是 Codex `spawn_agent(agent_type=...)` 使用的标识，不要求等于实际模型 ID。
 
-`status` / `test` / `repair` 必须使用该 profile。自定义 Provider 配置完成后，不应因为再次运行管理命令而被恢复成官方 URL。
-
-## 自定义 Provider 的模型目录
-
-Codex 需要模型目录条目来识别外部模型。对于 DeepSeek V4 Flash 的中转站，本 fork复用上游从 DeepSeek 官方 Codex setup 取得的 V4 Flash 模型能力模板，并把 `slug` 替换为 profile 中的实际模型 ID。
-
-这意味着本 fork 的“自定义模型 ID”主要针对：
-
-- DeepSeek V4 Flash 官方模型；
-- DeepSeek V4 Flash 的代理 / 中转站别名；
-- 与 DeepSeek V4 Flash 能力契约一致的后端。
-
-它不是一个任意模型目录生成器。若第三方模型与 DeepSeek V4 Flash 的上下文、tool call 或 reasoning 行为不同，不能仅靠改模型 ID 保证兼容。
-
-## Responses 协议边界
-
-Provider 写入：
-
-```toml
-wire_api = "responses"
-```
-
-因此中转站至少要正确处理 Codex 实际发送的 Responses 请求、流式事件和工具调用。一个服务即使宣传“OpenAI compatible”，如果只实现 `/chat/completions`，仍可能无法通过 `test`。
-
-验收优先相信真实运行结果，不相信服务商的兼容性标签。
-
-## Multi-Agent v1 / v2
-
-### `auto` 策略
-
-当前：
+默认自动推导：
 
 ```text
-backend=external -> v1
-backend=openai   -> v2
+gpt-5.6-luna       -> Luna
+gpt-5.6-terra      -> Terra
+gpt-5.6-sol        -> Sol
+deepseek-v4-flash  -> DeepSeek
 ```
 
-`backend` 表示中转站背后的最终协议处理方，而不是 URL 域名。
-
-### 为什么 external 默认 v1
-
-当前 Codex multi-agent v2 的跨 Provider 派发可能携带 OpenAI 专有的加密 `agent_message`。DeepSeek、Kimi、GLM、Ollama 或普通 Responses 中转后端可以兼容公开 API 结构，但无法据此推断它们能处理 OpenAI 内部加密 payload。
-
-因此：
+也支持用户显式指定：
 
 ```text
-OpenAI 父 Agent -> DeepSeek 官方       -> v1
-OpenAI 父 Agent -> 中转站 -> DeepSeek  -> v1
+--role FastLuna
 ```
 
-如果某中转站只是透明代理并最终把请求完整转发给 OpenAI 后端，可显式设置：
+或：
 
 ```text
-backend=openai
+--agent-name FastLuna
 ```
 
-让 `auto` 选择 v2。
+### 路径解析顺序
 
-用户也可以强制 `--multi-agent-version v2`，但 `external + v2` 会返回警告，并且不应把测试失败描述成 DeepSeek 模型本身不支持子代理。
+必须先加载 Profile 并设置动态 `ROLE`，再调用底层 `resolve_paths()`。
 
-## Reasoning effort
+正确顺序：
 
-支持：
+```text
+bootstrap paths
+    ↓
+读取 provider-profile.json
+    ↓
+解析 / 推导 Role
+    ↓
+apply_profile(Role)
+    ↓
+重新 resolve_paths
+    ↓
+$CODEX_HOME/agents/<Role>.toml
+```
+
+否则会出现 TOML 内 `name = "Luna"`，但文件仍错误写到 `DeepSeek.toml` 的假动态角色问题。
+
+### 角色变化
+
+Profile 保存 `role_auto`：
+
+- `true`：角色由模型自动推导；模型变化时角色跟着变化；
+- `false`：角色由用户手工指定；模型变化时保留角色。
+
+角色变化后，旧 Agent 文件只在 manifest 能证明它仍是本 Skill 未修改的受管理文件时删除。
+
+如果 hash 不一致，旧文件必须保留并返回警告。
+
+## 模型目录策略
+
+这是自定义模型接入最重要的兼容层之一。
+
+### 模型已经存在于 Codex 基础目录
+
+例如：
+
+```text
+gpt-5.6-luna
+```
+
+如果 `codex debug models` / 当前基础 catalog 已经包含相同 slug，本 fork：
+
+1. 复制该模型原始条目；
+2. 保留 display name、context window、tool 能力、input modalities、原 reasoning 档位等元数据；
+3. 只覆盖当前 Profile 明确要求修改的字段；
+4. 不再用 DeepSeek V4 Flash 的模型条目覆盖 Luna。
+
+这避免了“API 模型是 Luna，但本地模型能力描述还是 DeepSeek”的错误。
+
+### 模型不存在于基础目录
+
+只有当自定义模型 slug 不存在时，管理器才获取 DeepSeek 官方模型条目作为 Codex-compatible text-agent 结构模板，然后：
+
+- 替换 slug；
+- 修改显示信息；
+- 写入当前 reasoning 配置；
+- 再做真实直连与原生派发验收。
+
+这是 fallback，不代表未知模型与 DeepSeek 的所有能力完全相同。
+
+对于差异很大的未知模型，真实验收结果优先于静态模板。
+
+## Reasoning 模型目录
+
+Codex 当前内部模型 catalog 使用：
+
+```text
+default_reasoning_level
+supported_reasoning_levels
+```
+
+`--reasoning-effort` 控制当前默认值。
+
+例如：
+
+```text
+--reasoning-effort ultra
+```
+
+### 未指定 `--reasoning-efforts`
+
+如果模型已经存在：
+
+- 保留原有 `supported_reasoning_levels`；
+- 当前选择值如果不在列表中，则追加。
+
+例如原模型：
 
 ```text
 low
+medium
 high
+xhigh
 max
+ultra
 ```
 
-默认 `high`。
+选择：
 
-有效值同时作用于：
+```text
+--reasoning-effort ultra
+```
 
-1. `DeepSeek.toml` 的 `model_reasoning_effort`；
-2. `codex exec` 直连测试；
-3. `spawn_agent` 后查询的 SQLite `threads.reasoning_effort`。
+目录保持原列表，只把默认档位设为 `ultra`。
 
-这是对上游仓库 issue #3 的完整处理。仅修改 Agent TOML 而直连测试仍硬编码 `high` 不算完成。
+### 指定 `--reasoning-efforts`
+
+例如：
+
+```text
+--reasoning-efforts "minimal,medium,high,xhigh,ultra"
+```
+
+表示用户明确知道 Provider / 模型支持这些档位，因此用该列表覆盖当前模型目录暴露的 effort 选项。
+
+列表会：
+
+- 去重；
+- 保持输入顺序；
+- 自动包含当前 `--reasoning-effort`。
+
+### 未知模型
+
+如果模型本身不存在于基础目录，又没有提供 `--reasoning-efforts`，至少暴露当前选择的 effort，而不是继承 DeepSeek 固定三档。
+
+## API Key 与凭据
+
+API Key 不要求：
+
+```text
+sk-...
+```
+
+允许中转站自己的 token 格式。
+
+只要求：
+
+- 非空；
+- 无换行；
+- 长度处于合理范围。
+
+### 系统凭据
+
+macOS：
+
+```text
+Keychain
+```
+
+Windows：
+
+```text
+Credential Manager
+```
+
+DeepSeek 官方模式兼容原凭据 target：
+
+```text
+codex-deepseek-api-key
+```
+
+自定义 Provider 根据：
+
+```text
+provider + base_url
+```
+
+生成独立 target：
+
+```text
+codex-deepseek-api-key-<hash>
+```
+
+切换 Provider 不会把 API Key 写入 `config.toml`。
+
+旧 Provider 的系统凭据不会因为切换 Provider 被静默删除；只有用户明确要求删除当前凭据时才执行删除。
+
+## v1 / v2 原生派发
+
+### 默认外部 Provider
+
+```text
+backend = external
+multi_agent_version = auto
+```
+
+解析为：
+
+```text
+v1
+```
+
+原因不是 DeepSeek V4 Flash 模型本身，而是当前 Codex v2 跨 Provider Agent 消息路径可能包含外部 Provider 无法消费的 OpenAI 专有 Agent payload。
+
+因此下面这些场景默认都按跨 Provider 处理：
+
+```text
+Sol -> DeepSeek 官方 API
+Sol -> 中转站 -> DeepSeek
+Sol -> 中转站 -> GPT-5.6 Luna
+Sol -> Kimi / GLM / 其他第三方 Provider
+```
+
+模型名字属于 OpenAI 并不足以证明中转站路径可以安全使用 v2。
+
+### OpenAI backend
+
+只有确认 Provider 路径完整透明地支持 OpenAI v2 Agent 协议时才使用：
+
+```text
+backend = openai
+multi_agent_version = auto
+```
+
+此时解析为：
+
+```text
+v2
+```
+
+### 手动覆盖
+
+允许：
+
+```text
+--multi-agent-version v1
+--multi-agent-version v2
+```
+
+`external + v2` 会产生明确警告。
 
 ## 原生派发验收
 
-`setup` 或 `test` 会通过桌面内置运行时创建隔离验收会话。
+`setup` / `test` 使用桌面 Codex runtime 建立隔离任务。
 
-必须同时满足：
+验收必须同时满足：
 
-1. 自定义 Provider 直连成功；
-2. 新父任务真实调用 `spawn_agent(agent_type="DeepSeek", fork_turns="none")`；
-3. 子 Agent 返回精确口令 `NATIVE_DEEPSEEK_OK`；
-4. `$CODEX_HOME/state_*.sqlite` 中对应子线程满足：
+1. 直连请求成功；
+2. 父 Agent 真正调用 `spawn_agent`；
+3. 子 Agent 返回测试口令；
+4. SQLite `threads` 表对应 child thread 元数据正确。
+
+实际值来自当前 Profile：
 
 ```text
 model_provider = <profile.provider>
 model = <profile.model>
 reasoning_effort = <profile.reasoning_effort>
-agent_role = DeepSeek
+agent_role = <profile.role>
 ```
 
-只有这四项一致，才能称为真实跨 Provider 原生子 Agent。不能以子 Agent 自述代替数据库路由证据。
+不能只以返回文本中的模型自述判断路由成功。
 
-## `resume_agent` 已知问题与 workaround
+## `resume_agent` 边界
 
-上游 Codex 当前仍有一个独立恢复问题：
-
-- https://github.com/openai/codex/issues/26718
-- `resume_agent restores subagent history but not original model/reasoning settings`
-
-该问题描述：恢复子 Agent rollout/history 时，resume path 可能从当前调用者 Config 创建会话，而没有把原子线程持久化的 `TurnContextItem` 中 model / effort 等运行设置重新应用到 Config。
-
-对于跨 Provider DeepSeek，这可能表现为：
+上游 Codex 当前存在一种恢复行为风险：
 
 ```text
-第一次 spawn：
-model_provider = deepseek
-model = deepseek-v4-flash
-
-resume 后：
-错误继承父会话 / OpenAI 配置
+历史线程恢复成功
+但原子 Agent 的 model/provider/reasoning 没有可靠恢复
 ```
 
-随后就可能出现类似“当前 ChatGPT 账户不支持 deepseek-v4-flash”的错误，因为模型名被交给了错误的 Provider。
-
-这与本项目上游 issue #2 的现象高度一致。
-
-### 当前 workaround
-
-在 Codex 上游修复前：
+这会表现为：
 
 ```text
-不要 resume_agent(DeepSeek child)
+原来：provider=relay, model=gpt-5.6-luna
+resume 后：使用父线程/OpenAI 配置尝试启动 gpt-5.6-luna
 ```
 
-改为：
+从而可能出现类似：
 
 ```text
-DeepSeek child -> 返回 compact handoff
-parent         -> 保存 handoff
-parent         -> fresh spawn DeepSeek
-new child      -> handoff + remaining task
+当前 ChatGPT 账户不支持该第三方模型
 ```
 
-生成的 DeepSeek Agent 指令已经要求在可能继续工作的任务结束前输出 handoff，包括：
-
-- 已完成工作；
-- 剩余工作；
-- 相关文件 / symbol；
-- blocker。
-
-这不是对 Codex 内核的修复，而是避免恢复时 Provider 丢失的安全策略。将来 `openai/codex#26718` 修复并通过本项目真实路由测试后，可以重新评估允许 `resume_agent`。
-
-## Windows 与文件锁
-
-上游仓库 issue #1 曾报告原脚本无条件导入 Unix-only `fcntl`。
-
-当前底座已经采用：
+本 Skill 无法在配置层修复 Codex 内核的线程恢复实现，因此采用 workaround：
 
 ```text
-macOS / Unix -> fcntl
-Windows      -> msvcrt
+old child
+   ↓
+compact handoff
+   ↓
+fresh spawn same role
+   ↓
+continue with handoff
 ```
 
-并通过同一 `operation_lock` 实现跨平台进程锁。本 fork 不重新引入无条件 `fcntl` 依赖。
+这是一项兼容策略，不应描述成 `resume_agent` 已被修复。
 
-Windows 桌面 Codex 自动发现顺序仍由底座负责；常见安装路径和 PATH 都找不到时，可以设置：
+## Windows
+
+底层管理器使用：
+
+```python
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+```
+
+Windows 使用 `msvcrt` 文件锁。
+
+不要重新改成无条件 `import fcntl`。
+
+Codex Desktop runtime 自动发现失败时允许通过：
 
 ```text
 CODEX_DESKTOP_BIN
 ```
 
-## API Key
-
-API Key 从标准输入读取，不写入：
-
-- CLI 参数；
-- provider profile；
-- `config.toml`；
-- 模型目录；
-- 临时文件；
-- 测试结果；
-- 日志摘要。
-
-自定义 Provider 不检查 `sk-` 前缀，因为中转站 Key 命名没有统一规范。只要求：
-
-- 非空；
-- 不含换行；
-- 长度合理。
-
-不同自定义 `provider + base_url` 使用不同的系统凭据 target，减少切换中转站时误用旧 Key。
+指定 `codex.exe`。
 
 ## 配置事务
 
-写入前创建带时间戳的备份。底座继续负责：
+写入前创建备份。
 
-- 文件锁；
-- TOML / JSON 解析；
-- 原子写入；
-- manifest；
-- 冲突检测；
-- 失败回滚；
-- 卸载恢复。
+管理器：
 
-Provider profile 只在成功完成 `setup` / `repair` 后保存。失败的候选配置不应成为后续 `status` 的默认 profile。
+- 使用进程锁避免并发修改；
+- 先生成候选 TOML / JSON；
+- 解析验证后原子替换；
+- setup / test 失败时恢复事务；
+- 不静默覆盖不属于本 Skill 的冲突配置；
+- 角色文件删除前检查 manifest 与 hash。
 
 ## 视觉输入
 
-DeepSeek V4 Flash 子 Agent 按文本 Agent 使用。父 Agent 必须先检查图片、视频和截图，把必要事实写成文字任务包；子 Agent 不应声称自己看过视觉材料。
+默认自定义子 Agent 按 text-only 角色处理。
 
-## 上游 issue 对应关系
+图片、视频、截图等视觉输入应由父 Agent 先检查，再把必要事实转成文字任务包。
 
-### oil-oil/codex-deepseek-subagent#1
+即使底层模型理论上支持视觉，也不要在这个 Skill 尚未明确声明并验证视觉工具链前让子 Agent 声称自己看过视觉材料。
 
-Windows `fcntl`：当前上游底座已解决，本 fork 保留现有条件导入与 `msvcrt` 锁。
+## 安全结论
 
-### oil-oil/codex-deepseek-subagent#2
+本 Skill 的兼容性判定优先级：
 
-恢复 DeepSeek 后 Provider/模型错误：根因属于 Codex resume path；使用 fresh spawn + handoff workaround，并跟踪 `openai/codex#26718`。
+```text
+真实 Codex runtime 验收
+    >
+SQLite 路由元数据
+    >
+Provider / 模型静态声明
+    >
+模型名称或品牌推测
+```
 
-### oil-oil/codex-deepseek-subagent#3
-
-reasoning effort：本 fork 已支持 `low` / `high` / `max`，profile 持久化，并统一用于 Agent 配置、直连和 SQLite 验收。
+“模型叫 GPT”“接口号称 OpenAI 兼容”“子 Agent 自称某模型”都不足以单独证明原生路由正确。
