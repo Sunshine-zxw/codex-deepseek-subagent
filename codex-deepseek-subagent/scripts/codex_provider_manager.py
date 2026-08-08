@@ -127,7 +127,7 @@ def parse_reasoning_efforts(value: str | None) -> tuple[str, ...] | None:
 
 
 def infer_role(model: str) -> str:
-    lowered = model.lower()
+    all_tokens = [token.lower() for token in re.findall(r"[A-Za-z0-9]+", model)]
     known = (
         ("deepseek", "DeepSeek"),
         ("luna", "Luna"),
@@ -140,7 +140,7 @@ def infer_role(model: str) -> str:
         ("gemini", "Gemini"),
     )
     for marker, role in known:
-        if marker in lowered:
+        if marker in all_tokens:
             return role
 
     leaf = model.rsplit("/", 1)[-1]
@@ -530,6 +530,93 @@ refresh_interval_ms = 0
             )
         return {"direct": True}
 
+    def native_test(paths: Any, codex_bin: str) -> dict[str, Any]:
+        parent_model = manager.choose_parent_model(paths)
+        env = dict(manager.os.environ)
+        env["CODEX_HOME"] = str(paths.home)
+        prompt = (
+            f'Use the native spawn_agent tool exactly once. Set agent_type to {profile.role} and fork_turns to none. '
+            'Give it this task: Reply exactly NATIVE_DEEPSEEK_OK. '
+            "Then wait for that subagent and return only its final response."
+        )
+        proc = manager.subprocess.run(
+            [
+                codex_bin,
+                "exec",
+                "--skip-git-repo-check",
+                "--json",
+                "-s",
+                "read-only",
+                "-C",
+                str(paths.home),
+                "-m",
+                parent_model,
+                prompt,
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        if proc.returncode != 0:
+            raise manager.ManagerError(
+                "native_test_failed",
+                f"新 Codex 任务中的原生 spawn_agent(agent_type={profile.role}) 测试失败。",
+                {"stderr": proc.stderr[-1200:]},
+            )
+
+        child_ids: list[str] = []
+        child_messages: dict[str, str] = {}
+        for line in proc.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item = event.get("item") or {}
+            if (
+                event.get("type") == "item.completed"
+                and item.get("type") == "collab_tool_call"
+                and item.get("tool") == "spawn_agent"
+            ):
+                child_ids.extend(item.get("receiver_thread_ids") or [])
+            if (
+                event.get("type") == "item.completed"
+                and item.get("type") == "collab_tool_call"
+                and item.get("tool") == "wait"
+            ):
+                for receiver_id, state in (item.get("agents_states") or {}).items():
+                    if not isinstance(state, dict):
+                        continue
+                    message = state.get("message")
+                    if state.get("status") == "completed" and isinstance(message, str):
+                        child_messages[receiver_id] = message.strip()
+
+        child_id = child_ids[0] if len(child_ids) == 1 else None
+        child_message = child_messages.get(child_id) if child_id else None
+        metadata = manager.wait_for_child_metadata(paths, child_id) if child_id else None
+        expected = {
+            "model_provider": profile.provider,
+            "model": profile.model,
+            "reasoning_effort": profile.reasoning_effort,
+            "agent_role": profile.role,
+        }
+        if len(child_ids) != 1 or child_message != "NATIVE_DEEPSEEK_OK" or metadata != expected:
+            raise manager.ManagerError(
+                "native_route_mismatch",
+                "原生子 Agent 路由验收证据不完整或不符合当前 Provider Profile。",
+                {
+                    "child_ids": child_ids,
+                    "child_message": child_message,
+                    "metadata": metadata,
+                    "expected": expected,
+                },
+            )
+        return {
+            "desktop_fresh_session_native": True,
+            "child_id": child_id,
+            **expected,
+        }
+
     manager.expected_agent_text = expected_agent_text
     manager.managed_provider_block = managed_provider_block
     manager.provider_conflicts = provider_conflicts
@@ -537,6 +624,7 @@ refresh_interval_ms = 0
     manager.merged_catalog = merged_catalog
     manager.store_credential_key = store_credential_key
     manager.direct_test = direct_test
+    manager.native_test = native_test
 
 
 def cleanup_replaced_role(
