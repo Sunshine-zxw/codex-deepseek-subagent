@@ -449,6 +449,9 @@ refresh_interval_ms = 0
             None,
         )
         if existing is not None:
+            # The model already belongs to Codex's catalog. Preserve its picker
+            # visibility so this Skill never hides a native model the user
+            # already had before configuring the subagent.
             child_model = _patch_catalog_reasoning(existing, profile, preserve_existing=True)
         else:
             template = copy.deepcopy(original_fetch_model())
@@ -459,6 +462,10 @@ refresh_interval_ms = 0
             if "description" in child_model:
                 child_model["description"] = f"{profile.model} via {profile.provider_name}"
             child_model = _patch_catalog_reasoning(child_model, profile, preserve_existing=False)
+            # This entry exists only so the custom subagent runtime can resolve
+            # model metadata. Keep it addressable by model id, but do not add it
+            # to the main-session model picker.
+            child_model["visibility"] = "hide"
 
         models = [item for item in models if item.get("slug") != profile.model]
         models.append(child_model)
