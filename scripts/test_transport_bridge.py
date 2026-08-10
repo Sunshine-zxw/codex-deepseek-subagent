@@ -26,6 +26,12 @@ bridge = load("transport_bridge_test_impl", BRIDGE_PATH)
 cli = load("subagent_cli_transport_test_impl", CLI_PATH)
 
 
+def test_auto_profile_is_conservative() -> None:
+    assert bridge.effective_request_profile("auto") == "default"
+    assert bridge.effective_request_profile("auto-tool-choice") == "auto-tool-choice"
+    assert bridge.effective_request_profile("deepseek-thinking") == "deepseek-thinking"
+
+
 def test_deepseek_tool_choice_and_reasoning_roundtrip() -> None:
     payload = {
         "model": "deepseek-v4-flash",
@@ -79,7 +85,11 @@ def test_deepseek_tool_choice_and_reasoning_roundtrip() -> None:
 
     history = bridge.translate_input(
         [
-            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "use"}]},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "use"}],
+            },
             items[0],
             items[1],
             {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
@@ -91,6 +101,25 @@ def test_deepseek_tool_choice_and_reasoning_roundtrip() -> None:
     assert assistant["tool_calls"][0]["id"] == "call_1"
     tool_row = next(row for row in history if row["role"] == "tool")
     assert tool_row["tool_call_id"] == "call_1"
+
+
+def test_auto_tool_choice_does_not_inject_deepseek_thinking() -> None:
+    payload = {
+        "model": "deepseek-v4-flash",
+        "input": "use a tool",
+        "tools": [
+            {
+                "type": "function",
+                "name": "probe",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        "tool_choice": {"type": "function", "name": "probe"},
+        "reasoning": {"effort": "high"},
+    }
+    chat, _ = bridge.responses_to_chat(payload, "auto-tool-choice")
+    assert chat["tool_choice"] == "auto"
+    assert "thinking" not in chat
 
 
 def test_custom_tool_translation() -> None:
@@ -138,57 +167,78 @@ def test_sse_contains_codex_terminal_events() -> None:
     events = bridge.response_sse_events(response)
     assert events[0]["type"] == "response.created"
     assert any(event["type"] == "response.output_item.done" for event in events)
+    assert not any(event["type"] == "response.output_text.delta" for event in events)
     assert events[-1]["type"] == "response.completed"
+
+
+def _write_registry_and_state(home: Path, *, model: str = "deepseek-v4-flash") -> None:
+    state_dir = home / "codex-deepseek-subagent"
+    state_dir.mkdir(parents=True)
+    (state_dir / "registry.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "providers": {
+                    "go": {
+                        "provider": "go",
+                        "provider_name": "opencode Go",
+                        "base_url": "https://opencode.ai/zen/go/v1/",
+                        "backend": "external",
+                        "multi_agent_version": "auto",
+                        "credential_target": "x",
+                    }
+                },
+                "agents": {
+                    "DeepSeek": {
+                        "role": "DeepSeek",
+                        "provider": "go",
+                        "model": model,
+                        "reasoning_effort": "high",
+                        "reasoning_efforts": None,
+                        "role_auto": True,
+                    }
+                },
+                "metadata": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "transport-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "providers": {"go": {"transport": "chat_completions_bridge"}},
+                "agents": {"DeepSeek": {"request_profile": "auto-tool-choice"}},
+                "tool_compatibility": {},
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_sidecar_transport_state_resolution() -> None:
     with tempfile.TemporaryDirectory() as temp:
         home = Path(temp)
-        state_dir = home / "codex-deepseek-subagent"
-        state_dir.mkdir(parents=True)
-        (state_dir / "registry.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "providers": {
-                        "go": {
-                            "provider": "go",
-                            "provider_name": "opencode Go",
-                            "base_url": "https://opencode.ai/zen/go/v1/",
-                            "backend": "external",
-                            "multi_agent_version": "auto",
-                            "credential_target": "x",
-                        }
-                    },
-                    "agents": {
-                        "DeepSeek": {
-                            "role": "DeepSeek",
-                            "provider": "go",
-                            "model": "deepseek-v4-flash",
-                            "reasoning_effort": "high",
-                            "reasoning_efforts": None,
-                            "role_auto": True,
-                        }
-                    },
-                    "metadata": {},
-                }
-            ),
-            encoding="utf-8",
+        _write_registry_and_state(home)
+        provider, profile = bridge.provider_for_request(
+            "go",
+            "deepseek-v4-flash",
+            str(home),
         )
-        (state_dir / "transport-state.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "providers": {"go": {"transport": "chat_completions_bridge"}},
-                    "agents": {"DeepSeek": {"request_profile": "auto-tool-choice"}},
-                    "tool_compatibility": {},
-                }
-            ),
-            encoding="utf-8",
-        )
-        provider, profile = bridge.provider_for_request("go", "deepseek-v4-flash", str(home))
         assert provider["base_url"].startswith("https://opencode.ai/")
         assert profile == "auto-tool-choice"
+
+
+def test_bridge_rejects_unregistered_model() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        home = Path(temp)
+        _write_registry_and_state(home)
+        try:
+            bridge.provider_for_request("go", "not-registered", str(home))
+        except bridge.BridgeError as exc:
+            assert exc.code == "model_not_registered"
+        else:
+            raise AssertionError("unregistered model should be rejected")
 
 
 def test_cli_transport_options() -> None:
@@ -219,13 +269,20 @@ def test_cli_transport_options() -> None:
     )
     assert args.request_profile == "deepseek-thinking"
 
+    args = parser.parse_args(["tool-test", "--role", "DeepSeek"])
+    assert args.command == "tool-test"
+    assert args.role == "DeepSeek"
+
 
 def main() -> None:
     tests = [
+        test_auto_profile_is_conservative,
         test_deepseek_tool_choice_and_reasoning_roundtrip,
+        test_auto_tool_choice_does_not_inject_deepseek_thinking,
         test_custom_tool_translation,
         test_sse_contains_codex_terminal_events,
         test_sidecar_transport_state_resolution,
+        test_bridge_rejects_unregistered_model,
         test_cli_transport_options,
     ]
     for test in tests:
