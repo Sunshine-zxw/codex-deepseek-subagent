@@ -138,18 +138,45 @@ def platform_name() -> str:
     return "unsupported"
 
 
+def _probe_desktop_codex(candidate: str | Path) -> bool:
+    """Return whether the discovered binary can actually be launched.
+
+    Windows App Execution Alias paths can exist and be returned by
+    ``shutil.which`` while still producing ``WinError 5`` when launched from
+    Python. The CLI tests need a runnable binary, not merely a filesystem hit.
+    """
+
+    try:
+        proc = subprocess.run(
+            [str(candidate), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and bool(f"{proc.stdout}\n{proc.stderr}".strip())
+
+
 def find_desktop_codex() -> str:
     configured = os.environ.get("CODEX_DESKTOP_BIN")
     if configured:
         candidate = Path(configured).expanduser()
         if candidate.is_file():
-            return str(candidate.resolve())
+            resolved = str(candidate.resolve())
+            if _probe_desktop_codex(resolved):
+                return resolved
+            raise ManagerError(
+                "desktop_codex_unrunnable",
+                f"CODEX_DESKTOP_BIN 指向的 Codex 运行时无法启动：{candidate}。请改用可执行的桌面运行时路径。",
+            )
         raise ManagerError(
             "desktop_codex_missing",
             f"CODEX_DESKTOP_BIN 指向的文件不存在：{candidate}",
         )
 
     candidates: list[Path] = []
+    discovered_candidates: list[str] = []
     if platform_name() == "macos":
         candidates.extend(DESKTOP_CODEX_CANDIDATES)
     elif platform_name() == "windows":
@@ -159,12 +186,24 @@ def find_desktop_codex() -> str:
                 candidates.extend(Path(root) / relative for relative in WINDOWS_CODEX_RELATIVE_CANDIDATES)
     for candidate in candidates:
         if candidate.is_file():
-            return str(candidate.resolve())
+            resolved = str(candidate.resolve())
+            discovered_candidates.append(resolved)
+            if _probe_desktop_codex(resolved):
+                return resolved
 
     if platform_name() == "windows":
         discovered = shutil.which("codex.exe") or shutil.which("codex")
         if discovered:
-            return discovered
+            discovered_candidates.append(discovered)
+            if _probe_desktop_codex(discovered):
+                return discovered
+
+    if discovered_candidates:
+        raise ManagerError(
+            "desktop_codex_unrunnable",
+            "找到了 Codex 桌面运行时，但无法从当前 Python 进程启动。请设置 CODEX_DESKTOP_BIN 指向可执行的 Codex 运行时；WindowsApps 路径可能受系统 ACL 限制。",
+            {"candidates": discovered_candidates},
+        )
 
     raise ManagerError(
         "desktop_codex_missing",

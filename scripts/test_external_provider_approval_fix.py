@@ -55,6 +55,7 @@ def test_external_provider_routes_review_to_user_without_changing_sandbox() -> N
         (home / "config.toml").write_text(
             'model = "gpt-5.6-sol"\n'
             'approvals_reviewer = "auto_review"\n'
+            'approval_policy = "on-request"\n'
             'sandbox_mode = "workspace-write"\n'
             '\n[features]\n'
             'multi_agent_v2 = false\n',
@@ -64,12 +65,53 @@ def test_external_provider_routes_review_to_user_without_changing_sandbox() -> N
         assert result["status"] == "patched"
         parsed = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
         assert parsed["approvals_reviewer"] == "user"
+        assert parsed["approval_policy"] == "on-request"
         assert parsed["sandbox_mode"] == "workspace-write"
-        assert "approval_policy" not in parsed
         state = json.loads(
             (home / "codex-deepseek-subagent" / "approval-compat.json").read_text(encoding="utf-8")
         )
-        assert state["previous_approvals_reviewer"] == "auto_review"
+        assert state["schema_version"] == 2
+        assert state["changes"][0]["value"] == "auto_review"
+
+
+def test_active_profile_routes_review_to_user() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        write_registry(home, backend="external")
+        (home / "config.toml").write_text(
+            'profile = "work"\n'
+            'approvals_reviewer = "auto_review"\n'
+            '\n[profiles.work]\n'
+            'approvals_reviewer = "auto_review"\n'
+            'sandbox_mode = "workspace-write"\n',
+            encoding="utf-8",
+        )
+        result = mod.apply_fix(home)
+        assert result["status"] == "patched"
+        assert result["scope"] == "profiles.work"
+        parsed = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+        assert parsed["approvals_reviewer"] == "auto_review"
+        assert parsed["profiles"]["work"]["approvals_reviewer"] == "user"
+
+
+def test_removed_external_provider_restores_previous_reviewer() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        write_registry(home, backend="external")
+        config = home / "config.toml"
+        config.write_text(
+            'model = "gpt-5.6-sol"\n'
+            'approvals_reviewer = "auto_review"\n'
+            'sandbox_mode = "workspace-write"\n',
+            encoding="utf-8",
+        )
+        assert mod.apply_fix(home)["status"] == "patched"
+        write_registry(home, backend="openai")
+        result = mod.apply_fix(home)
+        assert result["status"] == "restored"
+        parsed = tomllib.loads(config.read_text(encoding="utf-8"))
+        assert parsed["approvals_reviewer"] == "auto_review"
+        assert not (home / "codex-deepseek-subagent" / "approval-compat.json").exists()
 
 
 def test_openai_backend_does_not_modify_reviewer() -> None:
@@ -95,10 +137,13 @@ def test_check_mode_reports_without_writing() -> None:
         result = mod.apply_fix(home, write=False)
         assert result["status"] == "would_patch"
         assert (home / "config.toml").read_text(encoding="utf-8") == original
+        assert not (home / "codex-deepseek-subagent" / "approval-compat.json").exists()
 
 
 def main() -> None:
     test_external_provider_routes_review_to_user_without_changing_sandbox()
+    test_active_profile_routes_review_to_user()
+    test_removed_external_provider_restores_previous_reviewer()
     test_openai_backend_does_not_modify_reviewer()
     test_check_mode_reports_without_writing()
     print("external provider approval compatibility tests passed")

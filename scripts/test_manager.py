@@ -228,8 +228,29 @@ class ManagerTests(unittest.TestCase):
             manager.shutil,
             "which",
             side_effect=[r"C:\Tools\codex.exe", None],
+        ), mock.patch.object(
+            manager,
+            "_probe_desktop_codex",
+            return_value=True,
         ):
             self.assertEqual(manager.find_desktop_codex(), r"C:\Tools\codex.exe")
+
+    def test_windows_desktop_codex_rejects_unrunnable_path_alias(self) -> None:
+        with mock.patch.dict(manager.os.environ, {}, clear=True), mock.patch.object(
+            manager,
+            "platform_name",
+            return_value="windows",
+        ), mock.patch.object(
+            manager.shutil,
+            "which",
+            return_value=r"C:\Program Files\WindowsApps\codex.exe",
+        ), mock.patch.object(
+            manager,
+            "_probe_desktop_codex",
+            return_value=False,
+        ), self.assertRaises(manager.ManagerError) as caught:
+            manager.find_desktop_codex()
+        self.assertEqual(caught.exception.code, "desktop_codex_unrunnable")
 
     def test_static_status_is_configured_with_complete_codex_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(

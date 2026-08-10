@@ -21,6 +21,12 @@ spec.loader.exec_module(module)
 
 
 class MultiProviderManagerTests(unittest.TestCase):
+    def test_new_agents_default_to_max_reasoning_effort(self):
+        args = module.build_parser().parse_args(
+            ["agent-add", "--provider", "relay", "--model", "gpt-5.6-luna"]
+        )
+        self.assertEqual(args.reasoning_effort, "max")
+
     def provider(
         self,
         provider: str,

@@ -45,6 +45,14 @@ def _safe_status(registry, codex_home=None):
         result["warnings"] = warnings
         if result.get("status") == "configured":
             result["status"] = "partial"
+    elif compat.get("status") in {"would_restore", "would_clean"}:
+        warnings = list(result.get("warnings") or [])
+        warnings.append(
+            "已没有正在使用的 external Provider，但仍存在审批兼容状态；运行 repair 可恢复此前的 approvals_reviewer。"
+        )
+        result["warnings"] = warnings
+        if result.get("status") == "configured":
+            result["status"] = "partial"
     return result
 
 

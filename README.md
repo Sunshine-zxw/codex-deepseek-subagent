@@ -47,10 +47,10 @@ Luna / DeepSeek / Kimi / GLM / 自定义角色
 
 ## 当前架构
 
-新的主入口：
+新的规范主入口：
 
 ```text
-codex-deepseek-subagent/scripts/codex_subagent_manager.py
+codex-deepseek-subagent/scripts/codex_subagent_cli.py
 ```
 
 它维护：
@@ -101,13 +101,13 @@ codex-deepseek-subagent/scripts/codex_provider_manager.py
 codex-deepseek-subagent/scripts/codex_deepseek.py
 ```
 
-已有单 Profile 配置无需重新输入全部参数，新管理器可以迁移：
+已有单 Profile 配置无需重新输入全部参数，规范入口可以迁移：
 
 ```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json migrate
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json migrate
 ```
 
-迁移后以后统一使用 `codex_subagent_manager.py`。
+以后统一使用 `codex_subagent_cli.py`。历史路径 `codex_subagent_manager.py` 仍保留，但直接执行时会自动转发到规范入口，避免绕过第三方 Provider 审批兼容层。
 
 ## 快速开始：添加第一个 Provider
 
@@ -141,7 +141,7 @@ API Key：
 py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-add `
   --provider relay_a `
   --model "gpt-5.6-luna" `
-  --reasoning-effort high
+  --reasoning-effort max
 ```
 
 没有写 `--role` 时会自动推导：
@@ -504,6 +504,7 @@ Hidden injected models
 python3 scripts/test_manager.py
 python3 scripts/test_provider_manager.py
 python3 scripts/test_multi_provider_manager.py
+python3 scripts/test_external_provider_approval_fix.py
 ```
 
 Windows：
@@ -512,6 +513,7 @@ Windows：
 py -3 scripts\test_manager.py
 py -3 scripts\test_provider_manager.py
 py -3 scripts\test_multi_provider_manager.py
+py -3 scripts\test_external_provider_approval_fix.py
 ```
 
 测试代码已加入仓库；在未实际执行测试的环境中不要声称测试已通过。

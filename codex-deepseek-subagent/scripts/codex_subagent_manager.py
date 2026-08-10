@@ -29,7 +29,9 @@ CATALOG_NAME = "models-with-subagents.json"
 PROVIDERS_BEGIN = "# BEGIN CODEX-CUSTOM-SUBAGENTS PROVIDERS"
 PROVIDERS_END = "# END CODEX-CUSTOM-SUBAGENTS PROVIDERS"
 LEGACY_PROFILE_NAME = low.PROFILE_NAME
-DEFAULT_EFFORT = low.DEFAULT_EFFORT
+# Native custom subagents default to the requested Luna-compatible maximum.
+# Legacy single-profile migrations keep the effort stored in that profile.
+DEFAULT_EFFORT = "max"
 
 
 @dataclass(frozen=True)
@@ -1001,4 +1003,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # The auth command is invoked by Codex from model_providers.*.auth.command.
+    # It must keep using the legacy implementation because the facade only
+    # exposes the public management commands.
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1].startswith("_credential-"):
+        raise SystemExit(main())
+
+    # Keep the historical path safe for users who still invoke this file
+    # directly. The facade adds the external-provider approval compatibility
+    # layer; imports used by the facade do not enter this branch.
+    import runpy
+
+    runpy.run_path(str(Path(__file__).with_name("codex_subagent_cli.py")), run_name="__main__")

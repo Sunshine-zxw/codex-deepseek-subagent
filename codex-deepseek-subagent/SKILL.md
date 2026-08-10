@@ -317,8 +317,10 @@ provider-add \
 agent-add \
   --provider relay_a \
   --model gpt-5.6-luna \
-  --reasoning-effort high
+  --reasoning-effort max
 ```
+
+多 Provider 管理器在未显式指定档位时默认使用 `max`；如果 Provider 的模型不支持该档位，应显式传入它支持的值。
 
 更新：
 

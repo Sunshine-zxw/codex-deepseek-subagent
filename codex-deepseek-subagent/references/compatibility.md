@@ -2,11 +2,13 @@
 
 ## 支持范围
 
-当前主入口：
+当前规范主入口：
 
 ```text
-scripts/codex_subagent_manager.py
+scripts/codex_subagent_cli.py
 ```
+
+`codex_subagent_manager.py` 是底层实现。为兼容旧命令，直接执行它时会转发到 `codex_subagent_cli.py`，因此不会绕过第三方 Provider 的审批兼容处理。
 
 支持：
 
@@ -20,6 +22,7 @@ scripts/codex_subagent_manager.py
 - 自动或自定义 Agent 角色名；
 - 任意非空 reasoning effort；
 - 可选 reasoning effort 档位集合；
+- 多 Provider Agent 未显式指定时默认使用 `max`；
 - multi-agent `auto / v1 / v2`；
 - macOS Keychain / Windows Credential Manager 独立凭据；
 - 第三方子 Agent 模型默认隐藏于主会话 picker。
@@ -149,6 +152,14 @@ codex-subagent-provider-<provider-id>
 同时会移除旧 DeepSeek 单 Provider marker，避免迁移后重复注册。
 
 如果移除 marker 后仍存在与 registry 同名的非托管 `model_providers.<id>`，视为冲突并停止，不静默覆盖。
+
+## 第三方 Provider 审批兼容
+
+当正在使用的 Agent 引用 `backend = "external"` Provider 时，规范入口会把当前生效配置中的 `approvals_reviewer` 路由到 `user`，避免第三方 Provider 请求不支持的 `codex-auto-review` 模型。它不修改 `approval_policy`、`sandbox_mode` 或 writable roots。
+
+如果配置使用 Codex named profile，兼容层会优先处理当前 `profile` 对应的 `[profiles.<name>]` 配置；删除最后一个 external Agent 后，仍未被用户手动改动的兼容性修改会恢复原值。
+
+配置变化后必须完全退出 Codex、重新打开并新建任务。真实审批链路仍需由用户决定是否允许。
 
 ## Agent 文件
 
