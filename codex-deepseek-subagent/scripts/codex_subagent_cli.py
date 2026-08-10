@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical multi-provider Codex subagent CLI with transport and tool-call compatibility management."""
+"""Canonical CLI for multi-provider Codex subagents, transport routing, and tool-call probes."""
 
 from __future__ import annotations
 
@@ -29,7 +29,10 @@ def _load(name: str, path: Path):
 
 
 multi = _load("codex_subagent_manager_impl", HERE / "codex_subagent_manager.py")
-approval_fix = _load("external_provider_approval_fix_impl", HERE / "external_provider_approval_fix.py")
+approval_fix = _load(
+    "external_provider_approval_fix_impl",
+    HERE / "external_provider_approval_fix.py",
+)
 bridge = _load("codex_transport_bridge_impl", HERE / "codex_transport_bridge.py")
 manager = multi.manager
 
@@ -47,7 +50,6 @@ TRANSPORT_STATE_SCHEMA_VERSION = 1
 
 _original_reconcile = multi.reconcile
 _original_status = multi.status
-_original_render_provider_block = multi.render_provider_block
 _ACTIVE_STATE: dict[str, Any] = {}
 
 
@@ -70,17 +72,29 @@ def load_transport_state(registry, codex_home: str | None = None) -> dict[str, A
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise manager.ManagerError("invalid_transport_state", f"无法读取 transport state：{path}") from exc
-        if not isinstance(state, dict) or state.get("schema_version") != TRANSPORT_STATE_SCHEMA_VERSION:
-            raise manager.ManagerError("invalid_transport_state", "transport-state.json schema 无效。")
+            raise manager.ManagerError(
+                "invalid_transport_state",
+                f"无法读取 transport state：{path}",
+            ) from exc
+        if (
+            not isinstance(state, dict)
+            or state.get("schema_version") != TRANSPORT_STATE_SCHEMA_VERSION
+        ):
+            raise manager.ManagerError(
+                "invalid_transport_state",
+                "transport-state.json schema 无效。",
+            )
     else:
         state = _empty_transport_state()
 
     providers = state.setdefault("providers", {})
     agents = state.setdefault("agents", {})
     compatibility = state.setdefault("tool_compatibility", {})
-    if not isinstance(providers, dict) or not isinstance(agents, dict) or not isinstance(compatibility, dict):
-        raise manager.ManagerError("invalid_transport_state", "transport state providers/agents/tool_compatibility 无效。")
+    if not all(isinstance(value, dict) for value in (providers, agents, compatibility)):
+        raise manager.ManagerError(
+            "invalid_transport_state",
+            "transport state providers/agents/tool_compatibility 无效。",
+        )
 
     for provider_id in registry.providers:
         entry = providers.setdefault(provider_id, {})
@@ -102,25 +116,51 @@ def load_transport_state(registry, codex_home: str | None = None) -> dict[str, A
     for role in list(compatibility):
         if role not in registry.agents:
             compatibility.pop(role, None)
+
+    # Validate all persisted values early so a broken sidecar cannot silently
+    # generate the wrong runtime provider block.
+    for provider_id in registry.providers:
+        provider_transport(state, provider_id)
+    for role in registry.agents:
+        agent_request_profile(state, role)
     return state
 
 
-def save_transport_state(state: dict[str, Any], codex_home: str | None = None) -> None:
+def save_transport_state(
+    state: dict[str, Any],
+    codex_home: str | None = None,
+) -> None:
     payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
     manager.atomic_write(_state_path(codex_home), payload.encode("utf-8"))
 
 
 def provider_transport(state: dict[str, Any], provider_id: str) -> str:
-    value = ((state.get("providers") or {}).get(provider_id) or {}).get("transport", TRANSPORT_RESPONSES)
+    value = (
+        ((state.get("providers") or {}).get(provider_id) or {}).get(
+            "transport",
+            TRANSPORT_RESPONSES,
+        )
+    )
     if value not in TRANSPORTS:
-        raise manager.ManagerError("invalid_transport", f"Provider {provider_id} transport 无效：{value}")
+        raise manager.ManagerError(
+            "invalid_transport",
+            f"Provider {provider_id} transport 无效：{value}",
+        )
     return value
 
 
 def agent_request_profile(state: dict[str, Any], role: str) -> str:
-    value = ((state.get("agents") or {}).get(role) or {}).get("request_profile", "auto")
+    value = (
+        ((state.get("agents") or {}).get(role) or {}).get(
+            "request_profile",
+            "auto",
+        )
+    )
     if value not in REQUEST_PROFILES:
-        raise manager.ManagerError("invalid_request_profile", f"Agent {role} request_profile 无效：{value}")
+        raise manager.ManagerError(
+            "invalid_request_profile",
+            f"Agent {role} request_profile 无效：{value}",
+        )
     return value
 
 
@@ -128,6 +168,13 @@ def effective_provider_base_url(provider_id: str, spec, state: dict[str, Any]) -
     if provider_transport(state, provider_id) == TRANSPORT_BRIDGE:
         return bridge.provider_base_url(provider_id)
     return spec.base_url
+
+
+def _bridge_required(registry, state: dict[str, Any]) -> bool:
+    return any(
+        provider_transport(state, agent.provider) == TRANSPORT_BRIDGE
+        for agent in registry.agents.values()
+    )
 
 
 def _render_provider_block(registry) -> str:
@@ -140,7 +187,12 @@ def _render_provider_block(registry) -> str:
             [
                 f"[model_providers.{provider_id}]",
                 f"name = {manager.toml_string(spec.provider_name)}",
-                f"base_url = {manager.toml_string(effective_provider_base_url(provider_id, spec, _ACTIVE_STATE))}",
+                (
+                    "base_url = "
+                    + manager.toml_string(
+                        effective_provider_base_url(provider_id, spec, _ACTIVE_STATE)
+                    )
+                ),
                 'wire_api = "responses"',
                 "",
                 f"[model_providers.{provider_id}.auth]",
@@ -155,13 +207,6 @@ def _render_provider_block(registry) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _bridge_required(registry, state: dict[str, Any]) -> bool:
-    return any(
-        provider_transport(state, agent.provider) == TRANSPORT_BRIDGE
-        for agent in registry.agents.values()
-    )
-
-
 def _safe_reconcile(registry, codex_home=None):
     bridge_status: dict[str, Any] | None = None
     if _bridge_required(registry, _ACTIVE_STATE):
@@ -169,28 +214,22 @@ def _safe_reconcile(registry, codex_home=None):
             bridge_status = bridge.ensure_running(codex_home)
         except bridge.BridgeError as exc:
             raise manager.ManagerError(exc.code, str(exc)) from exc
+
     result = _original_reconcile(registry, codex_home)
     save_transport_state(_ACTIVE_STATE, codex_home)
-    compat = approval_fix.apply_fix(approval_fix.resolve_home(codex_home), write=True)
+    approval = approval_fix.apply_fix(
+        approval_fix.resolve_home(codex_home),
+        write=True,
+    )
     return {
         **result,
-        "transport_bridge": bridge_status or {"required": False, "running": bridge.is_healthy()},
-        "external_provider_approval_compat": compat,
+        "transport_bridge": bridge_status
+        or {
+            "required": False,
+            "running": bridge.is_healthy(codex_home=codex_home),
+        },
+        "external_provider_approval_compat": approval,
     }
-
-
-def _recompute_status(result: dict[str, Any], registry, state: dict[str, Any]) -> None:
-    checks = result.get("checks") or {}
-    providers = checks.get("providers") or {}
-    parsed = multi._read_config(manager.resolve_paths(None if False else None)) if False else None
-    for provider_id, spec in registry.providers.items():
-        item = providers.get(provider_id)
-        if not isinstance(item, dict):
-            continue
-        item["transport"] = provider_transport(state, provider_id)
-        # `_original_status` compares against the upstream base URL. For bridge
-        # transports the runtime base URL is intentionally localhost, so repair
-        # that check from the actual config below in `_safe_status`.
 
 
 def _safe_status(registry, codex_home=None):
@@ -200,26 +239,36 @@ def _safe_status(registry, codex_home=None):
         config = multi._read_config(paths)
     except manager.ManagerError:
         config = {}
-    parsed_providers = config.get("model_providers") or {}
-    provider_checks = (result.get("checks") or {}).get("providers") or {}
+
+    checks = result.get("checks") or {}
+    provider_checks = checks.get("providers") or {}
+    actual_providers = config.get("model_providers") or {}
     for provider_id, spec in registry.providers.items():
         item = provider_checks.get(provider_id)
         if not isinstance(item, dict):
             continue
-        actual = parsed_providers.get(provider_id) or {}
-        item["base_url"] = actual.get("base_url") == effective_provider_base_url(provider_id, spec, _ACTIVE_STATE)
+        actual = actual_providers.get(provider_id) or {}
+        item["base_url"] = actual.get("base_url") == effective_provider_base_url(
+            provider_id,
+            spec,
+            _ACTIVE_STATE,
+        )
         item["transport"] = provider_transport(_ACTIVE_STATE, provider_id)
 
     bridge_needed = _bridge_required(registry, _ACTIVE_STATE)
-    bridge_running = bridge.is_healthy()
-    checks = result.get("checks") or {}
+    bridge_running = bridge.is_healthy(codex_home=codex_home)
     checks["transport_bridge_required"] = bridge_needed
     checks["transport_bridge_running"] = bridge_running
+
     compatibility = _ACTIVE_STATE.get("tool_compatibility") or {}
     for role, agent_item in (checks.get("agents") or {}).items():
-        if isinstance(agent_item, dict):
-            agent_item["request_profile"] = agent_request_profile(_ACTIVE_STATE, role)
-            agent_item["tool_compatibility"] = compatibility.get(role, {"status": "unknown"})
+        if not isinstance(agent_item, dict):
+            continue
+        agent_item["request_profile"] = agent_request_profile(_ACTIVE_STATE, role)
+        agent_item["tool_compatibility"] = compatibility.get(
+            role,
+            {"status": "unknown"},
+        )
 
     ready = (
         checks.get("config_valid") is True
@@ -241,16 +290,20 @@ def _safe_status(registry, codex_home=None):
     )
     result["status"] = "configured" if ready else "partial"
 
-    compat = approval_fix.apply_fix(approval_fix.resolve_home(codex_home), write=False)
-    result["external_provider_approval_compat"] = compat
-    if compat.get("status") == "would_patch":
+    approval = approval_fix.apply_fix(
+        approval_fix.resolve_home(codex_home),
+        write=False,
+    )
+    result["external_provider_approval_compat"] = approval
+    if approval.get("status") == "would_patch":
         warnings = list(result.get("warnings") or [])
         warnings.append(
-            "检测到 external Provider，但 approvals_reviewer 仍不是 user；Auto-review 可能通过第三方 Provider 请求 codex-auto-review 并失败。运行 repair 应用兼容修复。"
+            "检测到 external Provider，但 approvals_reviewer 仍不是 user；"
+            "Auto-review 可能通过第三方 Provider 请求 codex-auto-review。运行 repair 应用兼容修复。"
         )
         result["warnings"] = warnings
         result["status"] = "partial"
-    elif compat.get("status") in {"would_restore", "would_clean"}:
+    elif approval.get("status") in {"would_restore", "would_clean"}:
         warnings = list(result.get("warnings") or [])
         warnings.append("审批兼容状态可清理；运行 repair 恢复此前 reviewer。")
         result["warnings"] = warnings
@@ -258,12 +311,20 @@ def _safe_status(registry, codex_home=None):
     return result
 
 
+# The lower manager still owns registry/catalog/agent transactions. These two
+# hooks only change the runtime Provider base URL and add the approval policy
+# compatibility layer.
 multi.render_provider_block = _render_provider_block
 multi.reconcile = _safe_reconcile
 multi.status = _safe_status
 
 
-def _responses_endpoint(provider_id: str, spec, state: dict[str, Any], codex_home: str | None) -> str:
+def _responses_endpoint(
+    provider_id: str,
+    spec,
+    state: dict[str, Any],
+    codex_home: str | None,
+) -> str:
     if provider_transport(state, provider_id) == TRANSPORT_BRIDGE:
         try:
             bridge.ensure_running(codex_home)
@@ -277,7 +338,7 @@ def _post_responses(
     endpoint: str,
     api_key: str,
     payload: dict[str, Any],
-) -> tuple[list[dict[str, Any]], bool, dict[str, Any] | None]:
+) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         endpoint,
@@ -302,10 +363,16 @@ def _post_responses(
             {"http_status": exc.code},
         ) from exc
     except urllib.error.URLError as exc:
-        raise manager.ManagerError("tool_probe_unreachable", f"Tool Call probe 无法连接：{exc.reason}") from exc
+        raise manager.ManagerError(
+            "tool_probe_unreachable",
+            f"Tool Call probe 无法连接：{exc.reason}",
+        ) from exc
 
     text = raw.decode("utf-8", errors="replace")
-    if "text/event-stream" in content_type or any(line.startswith("data:") for line in text.splitlines()):
+    is_sse = "text/event-stream" in content_type or any(
+        line.startswith("data:") for line in text.splitlines()
+    )
+    if is_sse:
         items: list[dict[str, Any]] = []
         completed: dict[str, Any] | None = None
         for line in text.splitlines():
@@ -320,21 +387,40 @@ def _post_responses(
                 continue
             if not isinstance(event, dict):
                 continue
-            if event.get("type") == "response.output_item.done" and isinstance(event.get("item"), dict):
+            if (
+                event.get("type") == "response.output_item.done"
+                and isinstance(event.get("item"), dict)
+            ):
                 items.append(event["item"])
-            if event.get("type") == "response.completed" and isinstance(event.get("response"), dict):
+            if (
+                event.get("type") == "response.completed"
+                and isinstance(event.get("response"), dict)
+            ):
                 completed = event["response"]
         if completed is None:
-            raise manager.ManagerError("tool_probe_stream_incomplete", "Responses 流未返回 response.completed。")
+            raise manager.ManagerError(
+                "tool_probe_stream_incomplete",
+                "Responses 流未返回 response.completed。",
+            )
         return items, True, completed
 
     try:
         response_payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise manager.ManagerError("tool_probe_invalid_response", "Tool Call probe 返回非 JSON/非 SSE。") from exc
+        raise manager.ManagerError(
+            "tool_probe_invalid_response",
+            "Tool Call probe 返回非 JSON/非 SSE。",
+        ) from exc
     if not isinstance(response_payload, dict):
-        raise manager.ManagerError("tool_probe_invalid_response", "Tool Call probe 响应根对象无效。")
-    items = [item for item in response_payload.get("output") or [] if isinstance(item, dict)]
+        raise manager.ManagerError(
+            "tool_probe_invalid_response",
+            "Tool Call probe 响应根对象无效。",
+        )
+    items = [
+        item
+        for item in response_payload.get("output") or []
+        if isinstance(item, dict)
+    ]
     return items, False, response_payload
 
 
@@ -349,17 +435,23 @@ def _message_text(items: list[dict[str, Any]]) -> str:
     return "\n".join(pieces).strip()
 
 
-def _tool_call_item(items: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for item in items:
-        if item.get("type") in {"function_call", "custom_tool_call"}:
-            return item
-    return None
+def _tool_call_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in items
+        if item.get("type") in {"function_call", "custom_tool_call"}
+    ]
 
 
-def tool_compatibility_test(agent, registry, state: dict[str, Any], codex_home: str | None = None) -> dict[str, Any]:
+def tool_compatibility_test(
+    agent,
+    registry,
+    state: dict[str, Any],
+    codex_home: str | None = None,
+) -> dict[str, Any]:
     provider = registry.providers[agent.provider]
     transport = provider_transport(state, agent.provider)
-    profile = agent_request_profile(state, agent.role)
+    request_profile = agent_request_profile(state, agent.role)
     tested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     stages = {
         "first_response": False,
@@ -371,15 +463,25 @@ def tool_compatibility_test(agent, registry, state: dict[str, Any], codex_home: 
     result: dict[str, Any] = {
         "status": "fail",
         "transport": transport,
-        "request_profile": profile,
+        "request_profile": request_profile,
         "tested_at": tested_at,
         "stages": stages,
     }
+
     try:
         api_key = multi.read_credential(provider)
         if not api_key:
-            raise manager.ManagerError("credential_missing", f"Provider {agent.provider} 没有 API Key。")
-        endpoint = _responses_endpoint(agent.provider, provider, state, codex_home)
+            raise manager.ManagerError(
+                "credential_missing",
+                f"Provider {agent.provider} 没有 API Key。",
+            )
+        endpoint = _responses_endpoint(
+            agent.provider,
+            provider,
+            state,
+            codex_home,
+        )
+
         tool = {
             "type": "function",
             "name": "codex_subagent_probe",
@@ -405,45 +507,71 @@ def tool_compatibility_test(agent, registry, state: dict[str, Any], codex_home: 
                 }
             ],
         }
-        request1 = {
+
+        first_request = {
             "model": agent.model,
             "input": [user_item],
             "tools": [tool],
-            "tool_choice": {"type": "function", "name": "codex_subagent_probe"},
+            "tool_choice": {
+                "type": "function",
+                "name": "codex_subagent_probe",
+            },
             "parallel_tool_calls": False,
             "stream": True,
             "reasoning": {"effort": agent.reasoning_effort},
         }
-        items1, streamed1, _ = _post_responses(endpoint, api_key, request1)
+        first_items, first_streamed, _ = _post_responses(
+            endpoint,
+            api_key,
+            first_request,
+        )
         stages["first_response"] = True
-        stages["streaming"] = streamed1
-        call = _tool_call_item(items1)
-        if call is None:
-            raise manager.ManagerError("tool_probe_no_call", "模型没有产生 Tool Call。")
+        if not first_streamed:
+            raise manager.ManagerError(
+                "tool_probe_no_stream",
+                "stream=true 但 Provider 没有返回 Responses SSE。",
+            )
+
+        calls = _tool_call_items(first_items)
+        if len(calls) != 1:
+            raise manager.ManagerError(
+                "tool_probe_call_count",
+                f"预期恰好一个 Tool Call，实际 {len(calls)} 个。",
+            )
+        call = calls[0]
         stages["tool_call"] = True
         if call.get("name") != "codex_subagent_probe":
-            raise manager.ManagerError("tool_probe_wrong_tool", f"模型调用了错误工具：{call.get('name')}")
-        if call.get("type") == "custom_tool_call":
-            arguments = {"input": call.get("input")}
-        else:
-            try:
-                arguments = json.loads(str(call.get("arguments") or "{}"))
-            except json.JSONDecodeError as exc:
-                raise manager.ManagerError("tool_probe_bad_arguments", "Tool Call arguments 不是合法 JSON。") from exc
+            raise manager.ManagerError(
+                "tool_probe_wrong_tool",
+                f"模型调用了错误工具：{call.get('name')}",
+            )
+
+        try:
+            arguments = json.loads(str(call.get("arguments") or "{}"))
+        except json.JSONDecodeError as exc:
+            raise manager.ManagerError(
+                "tool_probe_bad_arguments",
+                "Tool Call arguments 不是合法 JSON。",
+            ) from exc
         if not isinstance(arguments, dict) or arguments.get("value") != 7:
-            raise manager.ManagerError("tool_probe_bad_arguments", f"Tool Call arguments 不符合预期：{arguments}")
+            raise manager.ManagerError(
+                "tool_probe_bad_arguments",
+                f"Tool Call arguments 不符合预期：{arguments}",
+            )
         stages["arguments_json"] = True
 
-        continuation_items = [item for item in items1 if item.get("type") in {"reasoning", "function_call", "custom_tool_call"}]
-        output_kind = "custom_tool_call_output" if call.get("type") == "custom_tool_call" else "function_call_output"
-        tool_output: dict[str, Any] = {
-            "type": output_kind,
+        continuation_items = [
+            item
+            for item in first_items
+            if item.get("type")
+            in {"reasoning", "function_call", "custom_tool_call"}
+        ]
+        tool_output = {
+            "type": "function_call_output",
             "call_id": call.get("call_id"),
             "output": "probe-result-7",
         }
-        if output_kind == "custom_tool_call_output":
-            tool_output["name"] = "codex_subagent_probe"
-        request2 = {
+        second_request = {
             "model": agent.model,
             "input": [user_item, *continuation_items, tool_output],
             "tools": [tool],
@@ -452,49 +580,81 @@ def tool_compatibility_test(agent, registry, state: dict[str, Any], codex_home: 
             "stream": True,
             "reasoning": {"effort": agent.reasoning_effort},
         }
-        items2, streamed2, _ = _post_responses(endpoint, api_key, request2)
-        stages["streaming"] = stages["streaming"] and streamed2
-        final_text = _message_text(items2)
+        second_items, second_streamed, _ = _post_responses(
+            endpoint,
+            api_key,
+            second_request,
+        )
+        if not second_streamed:
+            raise manager.ManagerError(
+                "tool_probe_no_stream_continuation",
+                "Tool Result continuation 没有返回 Responses SSE。",
+            )
+        stages["streaming"] = True
+
+        final_text = _message_text(second_items)
         if final_text.strip() != "TOOL_PROBE_OK":
-            raise manager.ManagerError("tool_probe_bad_continuation", f"Tool result 后续响应不符合预期：{final_text!r}")
+            raise manager.ManagerError(
+                "tool_probe_bad_continuation",
+                f"Tool Result 后续响应不符合预期：{final_text!r}",
+            )
         stages["tool_result_continuation"] = True
         result["status"] = "pass"
         result["endpoint_kind"] = transport
         return result
     except manager.ManagerError as exc:
-        result["error"] = {"code": exc.code, "message": str(exc), **exc.details}
+        result["error"] = {
+            "code": exc.code,
+            "message": str(exc),
+            **exc.details,
+        }
         return result
     except Exception as exc:
-        result["error"] = {"code": "tool_probe_failed", "message": f"{type(exc).__name__}: {exc}"}
+        result["error"] = {
+            "code": "tool_probe_failed",
+            "message": f"{type(exc).__name__}: {exc}",
+        }
         return result
 
 
-def _annotate_list(payload: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+def _annotate_list(
+    payload: dict[str, Any],
+    registry,
+    state: dict[str, Any],
+    codex_home: str | None,
+) -> dict[str, Any]:
     compatibility = state.get("tool_compatibility") or {}
     for provider in payload.get("providers") or []:
         provider_id = provider.get("provider")
-        if provider_id:
-            provider["transport"] = provider_transport(state, provider_id)
-            provider["runtime_base_url"] = effective_provider_base_url(provider_id, multi.ProviderSpec(**{k: provider[k] for k in ("provider", "provider_name", "base_url", "backend", "multi_agent_version", "credential_target")}), state) if False else None
-            provider.pop("runtime_base_url", None)
+        spec = registry.providers.get(provider_id)
+        if not provider_id or spec is None:
+            continue
+        provider["transport"] = provider_transport(state, provider_id)
+        provider["runtime_base_url"] = effective_provider_base_url(
+            provider_id,
+            spec,
+            state,
+        )
     for agent in payload.get("agents") or []:
         role = agent.get("role")
-        if role:
-            agent["request_profile"] = agent_request_profile(state, role)
-            agent["tool_compatibility"] = compatibility.get(role, {"status": "unknown"})
+        if not role:
+            continue
+        agent["request_profile"] = agent_request_profile(state, role)
+        agent["tool_compatibility"] = compatibility.get(
+            role,
+            {"status": "unknown"},
+        )
+
     payload["transport_bridge"] = {
-        "required": any(
-            provider_transport(state, provider_id) == TRANSPORT_BRIDGE
-            for provider_id in (state.get("providers") or {})
-        ),
-        "running": bridge.is_healthy(),
+        "required": _bridge_required(registry, state),
+        "running": bridge.is_healthy(codex_home=codex_home),
         "port": bridge.bridge_port(),
     }
     return payload
 
 
 def _subparsers(parser: argparse.ArgumentParser):
-    for action in parser._actions:  # argparse exposes no public accessor for subparser choices.
+    for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
             return action
     raise RuntimeError("subparser action missing")
@@ -503,13 +663,28 @@ def _subparsers(parser: argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = multi.build_parser()
     sub = _subparsers(parser)
-    sub.choices["provider-add"].add_argument("--transport", choices=TRANSPORTS, default=TRANSPORT_RESPONSES)
-    sub.choices["provider-update"].add_argument("--transport", choices=TRANSPORTS)
-    sub.choices["agent-add"].add_argument("--request-profile", choices=REQUEST_PROFILES, default="auto")
-    sub.choices["agent-update"].add_argument("--request-profile", choices=REQUEST_PROFILES)
 
-    p = sub.add_parser("tool-test")
-    group = p.add_mutually_exclusive_group(required=True)
+    sub.choices["provider-add"].add_argument(
+        "--transport",
+        choices=TRANSPORTS,
+        default=TRANSPORT_RESPONSES,
+    )
+    sub.choices["provider-update"].add_argument(
+        "--transport",
+        choices=TRANSPORTS,
+    )
+    sub.choices["agent-add"].add_argument(
+        "--request-profile",
+        choices=REQUEST_PROFILES,
+        default="auto",
+    )
+    sub.choices["agent-update"].add_argument(
+        "--request-profile",
+        choices=REQUEST_PROFILES,
+    )
+
+    tool_test = sub.add_parser("tool-test")
+    group = tool_test.add_mutually_exclusive_group(required=True)
     group.add_argument("--role")
     group.add_argument("--all", action="store_true")
 
@@ -519,48 +694,89 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _update_state_after_mutation(args, mutation: dict[str, Any], state: dict[str, Any]) -> None:
+def _invalidate_provider_agents(
+    provider_id: str,
+    registry,
+    state: dict[str, Any],
+) -> None:
+    compatibility = state.setdefault("tool_compatibility", {})
+    for role, agent in registry.agents.items():
+        if agent.provider == provider_id:
+            compatibility.pop(role, None)
+
+
+def _update_state_after_mutation(
+    args,
+    mutation: dict[str, Any],
+    registry,
+    state: dict[str, Any],
+) -> None:
     providers = state.setdefault("providers", {})
     agents = state.setdefault("agents", {})
     compatibility = state.setdefault("tool_compatibility", {})
+
     if args.command == "provider-add":
         providers[args.provider] = {"transport": args.transport}
-    elif args.command == "provider-update" and args.transport is not None:
-        providers.setdefault(args.provider, {})["transport"] = args.transport
-    elif args.command == "provider-remove":
+        return
+
+    if args.command == "provider-update":
+        if args.transport is not None:
+            previous = provider_transport(state, args.provider)
+            providers.setdefault(args.provider, {})["transport"] = args.transport
+            if previous != args.transport:
+                _invalidate_provider_agents(args.provider, registry, state)
+        return
+
+    if args.command == "provider-remove":
         providers.pop(args.provider, None)
         for role in mutation.get("removed_agents") or []:
             agents.pop(role, None)
             compatibility.pop(role, None)
-    elif args.command == "agent-add":
+        return
+
+    if args.command == "agent-add":
         role = mutation["agent"]["role"]
         agents[role] = {"request_profile": args.request_profile}
         compatibility.pop(role, None)
-    elif args.command == "agent-update":
-        previous = mutation.get("previous_role")
-        current = mutation["agent"]["role"]
-        entry = agents.pop(previous, {"request_profile": "auto"})
-        previous_compat = compatibility.pop(previous, None)
+        return
+
+    if args.command == "agent-update":
+        previous_role = mutation.get("previous_role")
+        current_role = mutation["agent"]["role"]
+        entry = agents.pop(previous_role, {"request_profile": "auto"})
+        compatibility.pop(previous_role, None)
         if args.request_profile is not None:
             entry["request_profile"] = args.request_profile
-        agents[current] = entry
-        if previous_compat is not None and previous == current:
-            compatibility[current] = previous_compat
-        else:
-            compatibility.pop(current, None)
-    elif args.command == "agent-remove":
+        agents[current_role] = entry
+        compatibility.pop(current_role, None)
+        return
+
+    if args.command == "agent-remove":
         agents.pop(args.role, None)
         compatibility.pop(args.role, None)
 
 
-def _run_tool_tests(roles: list[str], registry, state: dict[str, Any], codex_home: str | None) -> tuple[dict[str, Any], bool]:
+def _run_tool_tests(
+    roles: list[str],
+    registry,
+    state: dict[str, Any],
+    codex_home: str | None,
+) -> tuple[dict[str, Any], bool]:
     results: dict[str, Any] = {}
     all_pass = True
     for role in roles:
         agent = registry.agents.get(role)
         if agent is None:
-            raise manager.ManagerError("agent_missing", f"Agent 不存在：{role}")
-        probe = tool_compatibility_test(agent, registry, state, codex_home)
+            raise manager.ManagerError(
+                "agent_missing",
+                f"Agent 不存在：{role}",
+            )
+        probe = tool_compatibility_test(
+            agent,
+            registry,
+            state,
+            codex_home,
+        )
         state.setdefault("tool_compatibility", {})[role] = probe
         results[role] = probe
         all_pass = all_pass and probe.get("status") == "pass"
@@ -585,54 +801,99 @@ def main() -> int:
             sys.stdout.write(secret)
             return 0
 
-        registry, migrated = multi.load_registry(args.codex_home, migrate_legacy=True)
+        registry, migrated = multi.load_registry(
+            args.codex_home,
+            migrate_legacy=True,
+        )
         state = load_transport_state(registry, args.codex_home)
         _ACTIVE_STATE = state
 
         if args.command == "bridge-status":
-            payload = {"status": "ok", "running": bridge.is_healthy(), "port": bridge.bridge_port()}
+            payload = {
+                "status": "ok",
+                "running": bridge.is_healthy(codex_home=args.codex_home),
+                "port": bridge.bridge_port(),
+                "health": bridge.health_payload(),
+            }
         elif args.command == "bridge-start":
-            payload = {"status": "ok", **bridge.ensure_running(args.codex_home)}
+            payload = {
+                "status": "ok",
+                **bridge.ensure_running(args.codex_home),
+            }
         elif args.command == "bridge-stop":
-            payload = {"status": "ok", **bridge.stop(args.codex_home)}
+            payload = {
+                "status": "ok",
+                **bridge.stop(args.codex_home),
+            }
         elif args.command == "list":
-            payload = _annotate_list(multi.list_payload(registry), state)
+            payload = _annotate_list(
+                multi.list_payload(registry),
+                registry,
+                state,
+                args.codex_home,
+            )
         elif args.command == "status":
             payload = multi.status(registry, args.codex_home)
             payload["legacy_migration_available"] = migrated
         elif args.command == "migrate":
             if not migrated and multi.registry_path(args.codex_home).is_file():
                 save_transport_state(state, args.codex_home)
-                payload = {"status": "ok", "message": "registry 已存在；transport state 已初始化。"}
+                payload = {
+                    "status": "ok",
+                    "message": "registry 已存在；transport state 已初始化。",
+                }
             elif not migrated:
                 save_transport_state(state, args.codex_home)
-                payload = {"status": "ok", "message": "没有检测到旧单 Profile 配置。"}
+                payload = {
+                    "status": "ok",
+                    "message": "没有检测到旧单 Profile 配置。",
+                }
             else:
                 result = multi.reconcile(registry, args.codex_home)
-                payload = {"status": "configured", "migrated": True, **result}
+                payload = {
+                    "status": "configured",
+                    "migrated": True,
+                    **result,
+                }
         elif args.command == "repair":
             result = multi.reconcile(registry, args.codex_home)
             payload = {"status": "configured", **result}
         elif args.command == "tool-test":
             roles = list(registry.agents) if args.all else [args.role]
-            results, all_pass = _run_tool_tests(roles, registry, state, args.codex_home)
-            payload = {"status": "compatible" if all_pass else "incompatible", "tool_tests": results}
+            results, all_pass = _run_tool_tests(
+                roles,
+                registry,
+                state,
+                args.codex_home,
+            )
+            payload = {
+                "status": "compatible" if all_pass else "incompatible",
+                "tool_tests": results,
+            }
         elif args.command == "test":
             roles = list(registry.agents) if args.all else [args.role]
-            tool_results, all_tools_pass = _run_tool_tests(roles, registry, state, args.codex_home)
-            results = {}
+            tool_results, all_tools_pass = _run_tool_tests(
+                roles,
+                registry,
+                state,
+                args.codex_home,
+            )
+            tests: dict[str, Any] = {}
             for role in roles:
                 agent = registry.agents.get(role)
                 if agent is None:
-                    raise manager.ManagerError("agent_missing", f"Agent 不存在：{role}")
-                results[role] = {
+                    raise manager.ManagerError(
+                        "agent_missing",
+                        f"Agent 不存在：{role}",
+                    )
+                tests[role] = {
                     **multi.direct_test(agent, args.codex_home),
                     "tool_compatibility": tool_results[role],
                     **multi.native_test(agent, args.codex_home),
                 }
             payload = {
                 "status": "ok" if all_tools_pass else "incompatible",
-                "tests": results,
+                "tests": tests,
             }
         else:
             if args.command == "provider-add":
@@ -648,8 +909,17 @@ def main() -> int:
             elif args.command == "agent-remove":
                 mutation = multi.remove_agent_cmd(args, registry)
             else:
-                raise manager.ManagerError("invalid_command", f"未知命令：{args.command}")
-            _update_state_after_mutation(args, mutation, state)
+                raise manager.ManagerError(
+                    "invalid_command",
+                    f"未知命令：{args.command}",
+                )
+
+            _update_state_after_mutation(
+                args,
+                mutation,
+                registry,
+                state,
+            )
             _ACTIVE_STATE = state
             result = multi.reconcile(registry, args.codex_home)
             payload = {
@@ -660,19 +930,35 @@ def main() -> int:
             }
 
         manager.emit(payload, args.json)
-        return 0 if payload.get("status") not in {"partial", "failed", "incompatible"} else 2
+        return 0 if payload.get("status") not in {
+            "partial",
+            "failed",
+            "incompatible",
+        } else 2
     except bridge.BridgeError as exc:
-        manager.emit(manager.result(exc.code, message=str(exc)), getattr(args, "json", False))
+        manager.emit(
+            manager.result(exc.code, message=str(exc)),
+            getattr(args, "json", False),
+        )
         return 2
     except manager.ManagerError as exc:
-        manager.emit(manager.result(exc.code, message=str(exc), **exc.details), getattr(args, "json", False))
+        manager.emit(
+            manager.result(exc.code, message=str(exc), **exc.details),
+            getattr(args, "json", False),
+        )
         return 2
     except subprocess.TimeoutExpired:
-        manager.emit(manager.result("timeout", message="操作超时。"), getattr(args, "json", False))
+        manager.emit(
+            manager.result("timeout", message="操作超时。"),
+            getattr(args, "json", False),
+        )
         return 3
     except Exception as exc:
         manager.emit(
-            manager.result("failed", message=f"{type(exc).__name__}: {exc}"),
+            manager.result(
+                "failed",
+                message=f"{type(exc).__name__}: {exc}",
+            ),
             getattr(args, "json", False),
         )
         return 1
