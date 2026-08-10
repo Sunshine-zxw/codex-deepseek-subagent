@@ -1,78 +1,54 @@
 ---
 name: codex-deepseek-subagent
-description: 配置、检查、测试、修复或管理 Codex 原生第三方子 Agent；支持多个 Responses-compatible Provider、多个 Agent、独立凭据、自定义角色和 reasoning effort。普通已配置后的编码任务不要重复运行管理流程。
+description: 配置、检查、测试、修复或管理 Codex 原生第三方子 Agent；支持多个 Provider、多个 Agent、Responses 直连或轻量 Chat Completions bridge、独立凭据、自定义角色/reasoning，以及 per-Agent Tool Call 实测。普通编码任务不要重复运行管理流程。
 ---
 
 # Codex 多 Provider 子 Agent
 
-本 Skill 负责第三方 Provider、原生子 Agent 配置和真实路由验收，不承接普通编码任务。
+本 Skill 只负责第三方 Provider / 子 Agent 的配置与兼容性验收，不承接普通编码任务。
 
-## 主入口
-
-新的规范入口：
+## 唯一主入口
 
 ```text
 scripts/codex_subagent_cli.py
 ```
 
-它在多 Provider 管理器之上增加第三方 Provider 的审批兼容处理。
-
-底层实现：
-
-```text
-scripts/codex_subagent_manager.py
-scripts/codex_provider_manager.py
-scripts/codex_deepseek.py
-```
-
-除调试兼容问题外，不要绕过主入口直接使用底层脚本。
-
-Windows 使用：
+Windows：
 
 ```text
 py -3 <skill-dir>\scripts\codex_subagent_cli.py ...
 ```
 
-macOS 使用：
+macOS：
 
 ```text
 python3 <skill-dir>/scripts/codex_subagent_cli.py ...
 ```
 
-## 核心目标
-
-保持：
+除排障外，不要直接绕过主入口调用：
 
 ```text
-主 Codex / ChatGPT 登录
-        │
-        │ spawn_agent
-        ▼
-多个自定义子 Agent
-        │
-        ├── Provider A
-        ├── Provider B
-        ├── Provider C
-        └── Provider D
+codex_subagent_manager.py
+codex_provider_manager.py
+codex_deepseek.py
+codex_transport_bridge.py
 ```
 
-必须遵守：
+## 不变量
 
-- 不替换主 Codex 顶层模型或 ChatGPT 登录方式；
-- 第三方模型通过独立 `model_provider` 和独立系统凭据运行；
+必须保持：
+
+- 主 Codex 顶层模型和 ChatGPT/Codex 登录不变；
+- 第三方模型只作为自定义子 Agent；
 - 一个 Provider 可以被多个 Agent 复用；
-- Agent 与 Provider 分离存储；
-- Provider 必须真正兼容 Codex 所需的 Responses API、流式事件和工具调用；
-- 只有 `/chat/completions` 不足以证明兼容；
-- API Key 不出现在聊天、命令参数、TOML、模型目录或 registry；
-- Windows 使用 Credential Manager；macOS 使用 Keychain；
-- 新注入的第三方模型必须默认 `visibility = "hide"`，不进入主会话模型选择菜单；
-- Codex 原本已有的模型必须保留原 picker visibility；
-- reasoning effort 不限制为固定三档；
-- 第三方 `resume_agent` 继续使用 fresh-spawn + handoff workaround；
-- 不通过 `danger-full-access`、关闭 sandbox 或绕过审批来修复第三方 Provider 兼容问题。
+- API Key 只进入 Credential Manager / Keychain，不写聊天、TOML、registry、日志；
+- Skill 新注入的模型 `visibility = "hide"`，不进入主会话模型 picker；
+- Codex 原本已有模型保持原 visibility；
+- 默认角色 text-only；
+- 不为了兼容第三方 Provider 自动启用 `danger-full-access`；
+- 第三方 `resume_agent` 仍使用 fresh-spawn + handoff workaround。
 
-## Registry
+## 数据模型
 
 主注册表：
 
@@ -80,301 +56,366 @@ python3 <skill-dir>/scripts/codex_subagent_cli.py ...
 $CODEX_HOME/codex-deepseek-subagent/registry.json
 ```
 
-逻辑结构：
+Transport / Tool Call 状态：
 
 ```text
-providers
-├── relay_a
-├── relay_b
-└── deepseek
-
-agents
-├── Luna     -> relay_a / gpt-5.6-luna
-├── Terra    -> relay_a / gpt-5.6-terra
-├── Kimi     -> relay_b / kimi-k3
-└── DeepSeek -> deepseek / deepseek-v4-flash
+$CODEX_HOME/codex-deepseek-subagent/transport-state.json
 ```
 
-Agent 文件：
+Agent：
 
 ```text
 $CODEX_HOME/agents/<Role>.toml
 ```
 
-例如：
+模型目录：
 
 ```text
-$CODEX_HOME/agents/Luna.toml
+$CODEX_HOME/models-with-subagents.json
 ```
 
-## 第三方 Provider 的审批兼容
+## Provider Transport
 
-### 已知问题
-
-当父会话使用：
+Provider 支持两个 transport：
 
 ```text
-approvals_reviewer = "auto_review"
+responses
+chat_completions_bridge
 ```
 
-而子 Agent 使用第三方 / 中转 Provider 时，如果子 Agent 的操作需要真实审批，当前 Codex 可能让 Guardian 通过该第三方 Provider 请求内部模型：
+### `responses`
+
+默认。Codex 直接请求第三方 Provider 的 `/responses`。
+
+只有当该接口真实支持以下链路时才算完整兼容：
 
 ```text
-codex-auto-review
+Responses
++ streaming
++ tool schema
++ tool call
++ tool result continuation
 ```
 
-很多第三方 Provider 并不提供这个模型，常见结果是 400 / 403 / 404，并导致原操作 fail-closed。
+“文本能回复”不足以证明兼容。
 
-这不是仓库 ACL 或工作区写权限问题。
+### `chat_completions_bridge`
 
-### 本 Skill 的安全策略
+当 Provider 的 Responses 文本正常但 Tool Call 有问题，而 `/chat/completions` 工具调用正常时使用。
 
-只要 registry 中存在正在使用的：
+运行链路：
 
 ```text
-backend = external
+Codex Responses
+  -> 127.0.0.1 transport bridge
+  -> Chat Completions
+  -> upstream Provider
 ```
 
-主入口在 `reconcile` 后自动确保：
+Bridge：
+
+- Python stdlib；
+- 只监听 loopback；
+- 默认端口 `48671`；
+- 不保存 Key；
+- 不引入 Node.js / LiteLLM；
+- 仅在至少一个使用中的 Provider 选择 bridge 时需要运行。
+
+不要把所有 Provider 无条件切到 bridge；正常 Responses Provider 保持直连。
+
+## Request Profile
+
+Agent 可选：
 
 ```text
-approvals_reviewer = "user"
+auto
+default
+auto-tool-choice
+deepseek-thinking
+deepseek-nonthinking
 ```
 
-含义：
+规则：
 
-- workspace 内本来不需要审批的操作仍按原 sandbox 执行；
-- 真正需要越过 sandbox、网络或其他受保护边界的操作交给用户审批；
-- 不让第三方 Provider 去调用 `codex-auto-review`；
-- 不改变 `approval_policy`；
-- 不改变 `sandbox_mode`；
-- 不扩大 writable roots；
-- 不自动切换 `danger-full-access`。
+- `default`：普通 OpenAI-compatible Chat Completions；
+- `auto-tool-choice`：forced/required function tool choice 降为 `auto`；
+- `deepseek-thinking`：显式使用 DeepSeek thinking 参数、reasoning effort 映射并把 forced tool choice 降为 auto；
+- `deepseek-nonthinking`：显式关闭 DeepSeek thinking；
+- `auto`：只在兼容性已明确时使用自动行为；对中转/转售路径不应仅凭模型名推断其支持 DeepSeek 原生参数。
 
-兼容脚本：
+对于 opencode Go / 其他转售路径里的 DeepSeek，如果不确定其是否接受 DeepSeek 原生 `thinking` 参数，优先：
 
 ```text
-scripts/external_provider_approval_fix.py
+--request-profile auto-tool-choice
 ```
 
-通常不要单独调用；规范入口会自动处理。
-
-如果 `status` 返回：
+只有上游明确支持 DeepSeek 原生 thinking 参数时才显式使用：
 
 ```text
-external_provider_approval_compat.status = "would_patch"
+--request-profile deepseek-thinking
 ```
 
-运行：
+## DeepSeek Tool Call bridge 规则
+
+Bridge 必须保留完整的工具上下文：
 
 ```text
-... codex_subagent_cli.py --json repair
+assistant reasoning_content
+  + tool_calls
+  -> tool result
+  -> next assistant turn
 ```
 
-然后完全重启 Codex 并新建任务。
+实现要求：
 
-### 不要采用的错误修法
+1. Responses tool 定义转换成 Chat Completions function tools；
+2. forced tool choice 可按 request profile 规范化；
+3. Chat `reasoning_content` 转成 Responses `reasoning` item；
+4. Tool Result 下一轮再还原成 assistant `reasoning_content`；
+5. tool result 必须紧跟对应 assistant tool_calls；
+6. 连续 assistant tool-call 片段需要合并；
+7. custom tool 可通过 `{input: string}` function shim 往返转换。
 
-不要因为 `codex-auto-review` 失败就在单个 `Luna.toml` 中强行依赖：
+不能只让第一轮 tool call 成功而丢掉下一轮 continuation。
 
-```toml
-approval_policy = "never"
-sandbox_mode = "workspace-write"
-```
+## Per-Agent Tool Call 实测
 
-作为修复依据。
-
-当前 Codex 的 spawn 流程会在应用角色配置后重新同步父任务的运行时 approval policy、approvals reviewer 和 permission profile，因此这些角色字段不是解决该 Provider 兼容问题的可靠边界。
-
-## 多 Provider 的 multi-agent v1 / v2
-
-Provider 级配置：
+独立执行：
 
 ```text
-backend = external | openai
-multi_agent_version = auto | v1 | v2
+--json tool-test --role <Role>
 ```
 
-默认：
+或：
 
 ```text
-external + auto -> v1
-openai   + auto -> v2
+--json tool-test --all
 ```
 
-全局父模型规则：
+测试必须是真实 Provider 请求，固定两轮：
 
 ```text
-只要任一正在使用的 Agent 需要 v1
-→ 父模型统一 v1
+Round 1
+  -> 定义 codex_subagent_probe
+  -> 模型调用一次
+  -> 参数必须为 {"value": 7}
 
-只有所有正在使用的 Agent 都明确解析为 v2
-→ 父模型才使用 v2
+Round 2
+  -> 返回 function_call_output
+  -> 模型继续
+  -> 最终精确返回 TOOL_PROBE_OK
 ```
 
-普通中转站即使模型名是 `gpt-5.6-luna`，也默认按 `backend=external` 处理；模型品牌不能证明 Provider 路径支持 OpenAI v2 Agent payload。
-
-## 角色名
-
-常见模型默认自动推导：
+至少记录：
 
 ```text
-gpt-5.6-luna       -> Luna
-gpt-5.6-terra      -> Terra
-gpt-5.6-sol        -> Sol
-deepseek-v4-flash  -> DeepSeek
-kimi-*             -> Kimi
-qwen-*             -> Qwen
-glm-*              -> GLM
-claude-*            -> Claude
-gemini-*            -> Gemini
+first_response
+streaming
+tool_call
+arguments_json
+tool_result_continuation
 ```
 
-用户需要自定义时再传：
+最终结果：
 
 ```text
---role FastLuna
+pass / fail
 ```
 
-角色名决定：
+并保存至 `transport-state.json`，让 `list` / `status` 可见。
+
+`tool-test` 会产生少量第三方 Provider 调用额度，不要把它伪装成纯静态检查。
+
+## 完整 test
 
 ```text
-spawn_agent(agent_type="<Role>")
+--json test --role <Role>
 ```
 
-角色不是 Provider，也不是模型 ID。
-
-## Reasoning effort
-
-当前档位：
+现在完整测试顺序是：
 
 ```text
---reasoning-effort <value>
+文本直连
+  -> Tool Call 两轮实测
+  -> native spawn_agent
+  -> SQLite 路由元数据验收
 ```
 
-允许任意非空、无控制字符的 Provider/模型档位，例如：
+只有这些证据都成立，才可称该 Agent 适合完整 Codex 工具型子代理。
+
+如果 Tool Call fail，但文本/native spawn pass，应明确报告：
 
 ```text
-minimal
-low
-medium
-high
-xhigh
-max
-ultra
-turbo-provider-tier
+text-compatible, tool-incompatible
 ```
 
-如果用户明确知道完整档位列表，可传：
+不要将其标记成完整 ready。
+
+## 基本管理流程
+
+### 1. 先读取
 
 ```text
---reasoning-efforts "low,medium,high,xhigh"
+--json list
+--json status
 ```
 
-不要自行把未知档位映射成 `low/high/max`。
+不要先手工编辑 TOML。
 
-## 管理命令
+### 2. Provider
 
-查看全部：
-
-```text
-... codex_subagent_cli.py --json list
-```
-
-状态：
+新增 Responses Provider：
 
 ```text
-... codex_subagent_cli.py --json status
-```
-
-旧单 Profile 迁移：
-
-```text
-... codex_subagent_cli.py --json migrate
-```
-
-迁移后或 Skill 升级后建议执行：
-
-```text
-... codex_subagent_cli.py --json repair
-```
-
-添加 Provider：
-
-```text
-provider-add \
-  --provider relay_a \
-  --provider-name "Relay A" \
-  --base-url "https://relay.example/v1" \
-  --backend external \
-  --multi-agent-version auto \
+provider-add
+  --provider <id>
+  --provider-name <name>
+  --base-url <url>
+  --transport responses
+  --backend external
+  --multi-agent-version auto
   --api-key-stdin
 ```
 
-添加 Agent：
+新增 Chat bridge Provider：
 
 ```text
-agent-add \
-  --provider relay_a \
-  --model gpt-5.6-luna \
-  --reasoning-effort max
+provider-add
+  --provider <id>
+  --provider-name <name>
+  --base-url <upstream-url>
+  --transport chat_completions_bridge
+  --backend external
+  --multi-agent-version auto
+  --api-key-stdin
 ```
 
-多 Provider 管理器在未显式指定档位时默认使用 `max`；如果 Provider 的模型不支持该档位，应显式传入它支持的值。
+API Key 必须从 stdin 传入。
 
-更新：
+### 3. Agent
+
+```text
+agent-add
+  --provider <id>
+  --model <model-id>
+  [--role <Role>]
+  [--reasoning-effort <value>]
+  [--reasoning-efforts "..."]
+  [--request-profile <profile>]
+```
+
+常见模型角色名可自动推导；只有用户想自定义调用名时才显式设置 `--role`。
+
+reasoning effort 不限 `low/high/max`，允许 Provider 自定义非空字符串。
+
+### 4. 修改
+
+```text
+provider-update ...
+agent-update ...
+repair
+```
+
+Transport 或 request profile 变化后必须 `repair`，再 `tool-test`。
+
+### 5. 删除
+
+```text
+agent-remove --role <Role>
+provider-remove --provider <id>
+```
+
+Provider 仍被 Agent 引用时不能静默删除，除非用户明确选择 cascade。
+
+## opencode Go DeepSeek Flash 推荐流程
+
+如果已经证实：
+
+```text
+/responses 文本正常
+/responses Tool Call 异常
+/chat/completions Tool Call 正常
+```
+
+则：
 
 ```text
 provider-update
+  --provider opencode_go
+  --transport chat_completions_bridge
+```
+
+然后：
+
+```text
 agent-update
+  --role <DeepSeekRole>
+  --request-profile auto-tool-choice
 ```
 
-删除：
+再：
 
 ```text
-provider-remove
-agent-remove
+repair
+tool-test --role <DeepSeekRole>
+test --role <DeepSeekRole>
 ```
 
-测试单个：
+不要因为模型名是 DeepSeek 就自动启用 `deepseek-thinking`。
+
+## Bridge 管理
 
 ```text
-... codex_subagent_cli.py --json test --role Luna
+bridge-status
+bridge-start
+bridge-stop
 ```
 
-测试全部：
+通常无需手工 start；`repair` 在 bridge transport 正在使用时会尝试启动。
+
+日志：
 
 ```text
-... codex_subagent_cli.py --json test --all
+$CODEX_HOME/codex-deepseek-subagent/transport-bridge.log
 ```
 
-## 真实验收
+## Multi-agent v1/v2
 
-不能只相信子 Agent 自述。
-
-`test` 必须验证：
+第三方/普通中转：
 
 ```text
-Provider 直连
-    ↓
-父 Codex 原生 spawn_agent
-    ↓
-子 Agent 返回测试口令
-    ↓
-读取 state_*.sqlite
-    ↓
-核对：
-model_provider
-model
-reasoning_effort
-agent_role
+backend=external
+multi-agent-version=auto
+=> v1
 ```
 
-所有证据一致才算路由成功。
+只有真实验证 Provider 路径支持 Codex/OpenAI v2 Agent payload 时才能使用 v2。
 
-## Windows sandbox
+多 Provider 同时存在时：
 
-Windows sandbox 报错与 Provider 兼容是两类问题。
+```text
+任一正在使用的 Agent 需要 v1
+=> 父模型统一 v1
+```
+
+只有全部正在使用的 Provider 均为 v2 才切 v2。
+
+## external Provider 审批兼容
+
+当前 Codex Auto-review 可能让第三方子 Agent 去其第三方 Provider 请求内部 `codex-auto-review`，导致 403/404。
+
+本 Skill 的兼容策略是：
+
+```text
+external Provider active
+=> approvals_reviewer = user
+```
+
+这只是把审批交给用户，不关闭 sandbox，不把 approval policy 改成 never，也不使用 danger-full-access。
+
+## Sandbox
+
+Tool Call 协议问题与 Windows sandbox 问题必须分开诊断。
 
 如果出现：
 
@@ -383,36 +424,32 @@ windows sandbox: helper_unknown_error
 setup refresh had errors
 ```
 
-先排查 Windows sandbox/ACL/unelevated 模式，不要把它误诊成 API Key 或模型问题。
+不要把它归因于 Responses/Chat bridge，也不要通过扩大 Agent 权限隐藏问题。
 
-如果写 workspace 成功、但一到 approval-required 操作就出现 `codex-auto-review` 4xx，则优先按“第三方 Provider 审批兼容”处理。
+## `resume_agent`
 
-## resume_agent
-
-第三方 Agent 当前继续采用：
+第三方 Provider 的 child thread 继续采用：
 
 ```text
-旧 Agent 返回 compact handoff
-        ↓
-fresh spawn 同一 Role
-        ↓
-把 handoff 作为新任务上下文
+old child -> compact handoff -> fresh spawn same role
 ```
 
-不要把 `resume_agent` 当成可靠继续路径，直到上游确认恢复 model/provider/reasoning 的问题已修复并经过真实验收。
+不要声称 Skill 已修复 Codex 内核的 resume model/provider 恢复问题。
 
-## 安全边界
-
-- 不把 API Key 写入配置或聊天；
-- 不静默覆盖用户未受管理的 Provider 配置；
-- 不因为第三方 API 报错扩大 sandbox；
-- 不通过关闭审批规避 Provider 不支持 `codex-auto-review` 的问题；
-- Provider 兼容性优先采用“用户审批”降级，而不是“无审批”降级；
-- 配置变化后提示完全重启 Codex，并新建任务。
-
-详细说明见：
+## 验收优先级
 
 ```text
+真实 Provider Tool Call probe
+  + native Codex runtime
+  + SQLite child metadata
+  > 静态 Provider 声明
+  > 模型名称/品牌推测
+```
+
+详细说明：
+
+```text
+references/transport-and-tool-testing.md
 references/compatibility.md
 references/model-visibility.md
 ```
