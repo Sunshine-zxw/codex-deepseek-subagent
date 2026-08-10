@@ -6,7 +6,7 @@
 
 这个 fork 在原 `codex-deepseek-subagent` 基础上扩展为一个轻量的 **Codex 多 Provider / 多子 Agent 管理器**。
 
-目标不是替代 Codex 的主模型，也不是做本地协议代理，而是保持：
+目标是保持 Codex 主模型与 ChatGPT/Codex 登录不变，把第三方模型作为原生 custom subagent 使用：
 
 ```text
 GPT-5.6 Sol / 其他 Codex 主模型
@@ -22,505 +22,455 @@ Luna / DeepSeek / Kimi / GLM / 自定义角色
         └── Provider D
 ```
 
-第三方模型默认只作为子 Agent 使用。Skill 为未知模型注入的模型目录条目会设置：
+第三方模型默认只作为子 Agent 使用。Skill 新注入的模型目录条目会设置：
 
 ```json
 "visibility": "hide"
 ```
 
-因此它们不会污染 Codex 主会话的模型选择菜单。
+因此不会污染 Codex 主会话的模型选择菜单。Codex 原本已有的模型保持原来的 picker 可见性。
 
-如果某个模型本来就是 Codex 自带模型，例如官方 `gpt-5.6-luna`，管理器会保留它原来的 picker 可见性，不会误隐藏官方模型。
+## 当前能力
 
-## 适合什么场景
+- 多 Provider / 多 Agent 注册表；
+- 一个 Provider 可复用给多个 Agent；
+- Windows Credential Manager / macOS Keychain 独立凭据；
+- 自定义角色名；
+- 自定义 reasoning effort / reasoning 档位列表；
+- `responses` 直连；
+- 轻量 `chat_completions_bridge`；
+- per-Agent Tool Call 真实两轮兼容性测试；
+- native `spawn_agent` + SQLite 路由验收；
+- external Provider Auto-review 兼容处理；
+- 新注入模型默认从主会话 picker 隐藏；
+- multi-agent v1/v2 保守路由。
 
-推荐用于：
+本项目仍刻意不做 Anthropic Messages 转换、OAuth Provider 聚合、流量统计、托盘程序等完整 Router 功能。
 
-- 主 Agent 继续使用 ChatGPT / Codex 订阅；
-- 需要 1～5 个左右第三方 Provider；
-- 一个 Provider 下可以挂多个子 Agent；
-- 第三方接口已经真正兼容 Codex 所需的 OpenAI Responses API；
-- 不希望第三方子 Agent 模型出现在主会话模型菜单；
-- 不需要 LiteLLM、后台代理服务、Chat Completions/Anthropic Messages 协议转换。
+## 唯一规范入口
 
-如果第三方接口只有 `/chat/completions`、Anthropic Messages，或者需要 OAuth/大量厂商协议转换，应该考虑类似 Codex Router 的完整路由层，而不是继续扩大本项目范围。
-
-## 当前架构
-
-新的规范主入口：
+以后统一使用：
 
 ```text
 codex-deepseek-subagent/scripts/codex_subagent_cli.py
 ```
 
-它维护：
+Windows：
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py ...
+```
+
+macOS：
+
+```bash
+python3 codex-deepseek-subagent/scripts/codex_subagent_cli.py ...
+```
+
+除排障外，不要直接绕过主入口调用：
+
+```text
+codex_subagent_manager.py
+codex_provider_manager.py
+codex_deepseek.py
+codex_transport_bridge.py
+```
+
+## 配置文件
+
+主注册表：
 
 ```text
 $CODEX_HOME/codex-deepseek-subagent/registry.json
 ```
 
-注册表分成两个独立层：
+Transport / Tool Call 状态：
 
 ```text
-Providers
-├── relay_a
-├── relay_b
-└── deepseek
-
-Agents
-├── Luna     -> relay_a / gpt-5.6-luna
-├── Terra    -> relay_a / gpt-5.6-terra
-├── DeepSeek -> deepseek / deepseek-v4-flash
-└── Kimi     -> relay_b / kimi-k3
+$CODEX_HOME/codex-deepseek-subagent/transport-state.json
 ```
 
-每个 Agent 生成独立文件：
+Agent：
 
 ```text
-$CODEX_HOME/agents/Luna.toml
-$CODEX_HOME/agents/Terra.toml
-$CODEX_HOME/agents/DeepSeek.toml
-$CODEX_HOME/agents/Kimi.toml
+$CODEX_HOME/agents/<Role>.toml
 ```
 
-多个 Agent 可以共享同一个 Provider 和 API Key。
-
-## 与旧管理器的关系
-
-保留：
+合并模型目录：
 
 ```text
-codex-deepseek-subagent/scripts/codex_provider_manager.py
+$CODEX_HOME/models-with-subagents.json
 ```
 
-作为旧单 Profile 兼容管理器。
+## Transport
 
-原始底层管理器仍是：
+每个 Provider 可以选择：
 
 ```text
-codex-deepseek-subagent/scripts/codex_deepseek.py
+responses
+chat_completions_bridge
 ```
 
-已有单 Profile 配置无需重新输入全部参数，规范入口可以迁移：
+### `responses`
 
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json migrate
+默认。Codex 直接请求 Provider 的 `/responses`。
+
+文本回复正常并不代表完整兼容，至少还要验证：
+
+```text
+streaming
++ tool schema
++ tool call
++ tool result continuation
 ```
 
-以后统一使用 `codex_subagent_cli.py`。历史路径 `codex_subagent_manager.py` 仍保留，但直接执行时会自动转发到规范入口，避免绕过第三方 Provider 审批兼容层。
+### `chat_completions_bridge`
 
-## 快速开始：添加第一个 Provider
+当 Provider 的 `/responses` 文本正常但 Tool Call 有问题，而 `/chat/completions` 的工具调用正常时使用。
 
-Windows：
+```text
+Codex Responses
+  -> 127.0.0.1:48671 Python bridge
+  -> Chat Completions
+  -> upstream Provider
+```
+
+Bridge 只监听 loopback，不保存 API Key，不引入 Node.js / LiteLLM。
+
+不要把所有 Provider 无条件切换到 bridge；正常 Responses Provider 保持直连。
+
+## Request Profile
+
+每个 Agent 可以独立选择：
+
+```text
+auto
+default
+auto-tool-choice
+deepseek-thinking
+deepseek-nonthinking
+```
+
+推荐规则：
+
+- `default`：普通 OpenAI-compatible Chat Completions；
+- `auto-tool-choice`：将 forced/required function tool choice 降为 `auto`；
+- `deepseek-thinking`：显式启用 DeepSeek thinking 参数并映射 reasoning effort；
+- `deepseek-nonthinking`：显式关闭 DeepSeek thinking；
+- `auto`：保守默认，不仅凭模型名推断转售 Provider 支持原生 DeepSeek thinking 参数。
+
+对于 opencode Go / 其他转售路径中的 DeepSeek，优先从：
+
+```text
+--request-profile auto-tool-choice
+```
+
+开始测试。
+
+## 添加 Provider
+
+### Responses Provider
 
 ```powershell
 $relayKey = Read-Host "Relay API Key"
-$relayKey | py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json provider-add `
+$relayKey | py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json provider-add `
   --provider relay_a `
   --provider-name "Relay A" `
   --base-url "https://relay.example.com/v1" `
+  --transport responses `
   --backend external `
   --multi-agent-version auto `
   --api-key-stdin
 Remove-Variable relayKey
 ```
 
-`backend=external + auto` 会按 v1 处理第三方跨 Provider 子 Agent。
-
-API Key：
-
-- 不写入 TOML；
-- 不写入 registry；
-- Windows 存入 Credential Manager；
-- macOS 存入 Keychain；
-- 每个 Provider 使用独立 credential target。
-
-## 添加 Luna 子 Agent
+### Chat Completions bridge Provider
 
 ```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-add `
+$relayKey = Read-Host "Relay API Key"
+$relayKey | py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json provider-add `
+  --provider opencode_go `
+  --provider-name "opencode Go" `
+  --base-url "https://opencode.ai/zen/go/v1" `
+  --transport chat_completions_bridge `
+  --backend external `
+  --multi-agent-version auto `
+  --api-key-stdin
+Remove-Variable relayKey
+```
+
+API Key 只从 stdin 输入，并保存到系统凭据库。
+
+## 添加 Agent
+
+例如 Luna：
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json agent-add `
   --provider relay_a `
   --model "gpt-5.6-luna" `
   --reasoning-effort max
 ```
 
-没有写 `--role` 时会自动推导：
+常见模型可自动推导角色名，例如：
 
 ```text
 gpt-5.6-luna       -> Luna
 gpt-5.6-terra      -> Terra
-gpt-5.6-sol        -> Sol
 deepseek-v4-flash  -> DeepSeek
 kimi-*             -> Kimi
-qwen-*             -> Qwen
-glm-*              -> GLM
-claude-*           -> Claude
-gemini-*           -> Gemini
+qwen-*              -> Qwen
+glm-*               -> GLM
 ```
 
-如果要自定义名称：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-add `
-  --provider relay_a `
-  --model "gpt-5.6-luna" `
-  --role FastLuna `
-  --reasoning-effort high
-```
-
-之后直接在 Codex 里说：
+只有想自定义调用名时才需要显式：
 
 ```text
-让 Luna 子代理检查这个项目，你最后审核它的结论。
+--role <Role>
+```
+
+reasoning effort 不限制固定三档；Provider 可使用自定义非空字符串。
+
+## opencode Go DeepSeek Flash 推荐配置
+
+如果已经确认：
+
+```text
+/responses 文本正常
+/responses Tool Call 异常
+/chat/completions Tool Call 正常
+```
+
+先把 Provider 切换成 bridge：
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json provider-update `
+  --provider opencode_go `
+  --transport chat_completions_bridge
+```
+
+再把 Agent 设为保守工具选择兼容模式：
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json agent-update `
+  --role DeepSeek `
+  --request-profile auto-tool-choice
+```
+
+然后：
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json repair
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json tool-test --role DeepSeek
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json test --role DeepSeek
+```
+
+不要仅因为模型名是 DeepSeek 就自动启用 `deepseek-thinking`。
+
+## Tool Call 实测
+
+单个 Agent：
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json tool-test --role Luna
+```
+
+全部：
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json tool-test --all
+```
+
+测试固定两轮：
+
+```text
+Round 1
+  -> 定义 codex_subagent_probe
+  -> 必须调用一次
+  -> 参数必须为 {"value": 7}
+
+Round 2
+  -> 返回 function_call_output
+  -> 模型继续
+  -> 最终必须返回 TOOL_PROBE_OK
+```
+
+记录：
+
+```text
+first_response
+streaming
+tool_call
+arguments_json
+tool_result_continuation
+```
+
+只有全部成立才记为 `pass`。
+
+## 完整 Agent 测试
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json test --role Luna
 ```
 
 或：
 
-```text
-让 FastLuna 子代理先分析这个 bug。
-```
-
-## 一个 Provider 挂多个 Agent
-
-例如同一个中转站同时提供 Luna 和 Terra：
-
 ```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-add `
-  --provider relay_a `
-  --model "gpt-5.6-luna" `
-  --reasoning-effort xhigh
-
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-add `
-  --provider relay_a `
-  --model "gpt-5.6-terra" `
-  --reasoning-effort high
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json test --all
 ```
 
-最终：
+完整测试顺序：
 
 ```text
-relay_a
-├── Luna
-└── Terra
+文本直连
+  -> Tool Call 两轮实测
+  -> native spawn_agent
+  -> SQLite 路由元数据验收
 ```
 
-不需要为每个 Agent 重复保存 API Key。
-
-## 添加第 2～4 个 Provider
-
-重复 `provider-add` 即可：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json provider-add `
-  --provider relay_b `
-  --provider-name "Relay B" `
-  --base-url "https://relay-b.example.com/v1" `
-  --backend external `
-  --api-key-stdin
-```
-
-然后把 Agent 指向它：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-add `
-  --provider relay_b `
-  --model "kimi-k3" `
-  --role Kimi `
-  --reasoning-effort high
-```
-
-## Reasoning effort
-
-`--reasoning-effort` 不限制固定三档，可以使用 Codex 已知档位，也允许 Provider 自定义非空字符串：
+如果文本和 native spawn 正常、Tool Call 失败，应视为：
 
 ```text
-none
-minimal
-low
-medium
-high
-xhigh
-max
-ultra
-adaptive-high
-turbo-provider-tier
+text-compatible, tool-incompatible
 ```
 
-如果 Provider 明确告诉你完整档位列表：
+不能标成完整 ready。
+
+## 查看状态
 
 ```powershell
---reasoning-effort xhigh `
---reasoning-efforts "minimal,low,medium,high,xhigh,ultra"
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json list
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json status
 ```
 
-`--reasoning-efforts` 是可选的。
+`list/status` 会显示 Provider transport、Agent request profile，以及最近一次 Tool Call 兼容结果。
+
+## 修改 / Repair
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json provider-update ...
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json agent-update ...
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json repair
+```
+
+Transport 或 request profile 改变后必须 `repair`，然后重新 `tool-test`。
+
+## Bridge 管理
+
+```powershell
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json bridge-status
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json bridge-start
+py -3 codex-deepseek-subagent\scripts\codex_subagent_cli.py --json bridge-stop
+```
+
+正常情况下无需手动启动；当正在使用 bridge transport 时，`repair` 会尝试启动它。
+
+默认：
+
+```text
+127.0.0.1:48671
+```
+
+日志：
+
+```text
+$CODEX_HOME/codex-deepseek-subagent/transport-bridge.log
+```
 
 ## Multi-agent v1 / v2
 
-每个 Provider 独立保存：
+第三方普通中转建议：
 
 ```text
-backend
-multi_agent_version
+backend=external
+multi-agent-version=auto
+=> v1
 ```
 
-默认第三方中转站：
+只有真实验证支持 Codex/OpenAI v2 Agent payload 的路径才配置 v2。
+
+多 Provider 同时存在时采用保守规则：
 
 ```text
-backend = external
-multi_agent_version = auto
-→ effective v1
+任一正在使用的 Agent 需要 v1
+=> 父模型统一 v1
 ```
 
-完整透明支持 OpenAI v2 Agent 协议的路径才配置：
+## external Provider 审批兼容
+
+当前 Codex Auto-review 在第三方子 Agent 场景可能尝试通过第三方 Provider 请求内部 `codex-auto-review`，导致 403/404。
+
+本项目的兼容策略：
 
 ```text
-backend = openai
-multi_agent_version = auto
-→ effective v2
+external Provider active
+=> approvals_reviewer = user
 ```
 
-### 多 Provider 时的全局规则
-
-父 Codex 会话的 multi-agent 版本不是每个子 Agent 独立切换的，因此注册表采用保守规则：
-
-```text
-任意已使用 Provider 需要 v1
-→ 父模型保持 v1
-
-所有已使用 Provider 都明确为 v2
-→ 父模型才使用 v2
-```
-
-这避免一个外部 Provider 被另一个 v2 Provider 意外拖进不兼容协议。
+这不会关闭 sandbox，不会把 approval policy 改成 `never`，也不会自动启用 `danger-full-access`。
 
 ## 模型选择菜单
 
-本项目的默认目标是：
-
-```text
-第三方子 Agent 可调用
-≠
-第三方模型必须出现在主会话 picker
-```
-
-对 Codex 模型目录中原本不存在、由本项目新注入的模型：
+Skill 新注入的第三方模型：
 
 ```json
 "visibility": "hide"
 ```
 
-所以例如：
+因此只用于子 Agent，不进入主会话 model picker。
+
+Codex 原本已有的模型保持原 visibility。
+
+## `resume_agent`
+
+第三方 Provider 子线程暂时继续使用：
 
 ```text
-relay-luna
-relay-deepseek
-kimi-k3-custom
+old child -> compact handoff -> fresh spawn same role
 ```
 
-不会因为注册为子 Agent 就出现在你的主会话模型选择菜单。
+不要把 `resume_agent` 当作第三方 custom-provider Agent 的可靠主路径，直到 Codex 上游修复并经过真实验收。
 
-对 Codex 原本已有的模型，本项目不改变其 picker visibility。
+## Windows Sandbox
 
-## 查看全部 Provider / Agent
+Tool Call / Provider 协议问题与 Windows sandbox 问题要分开诊断。
 
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json list
-```
-
-输出会分别列出：
+出现：
 
 ```text
-providers
-agents
-parent_multi_agent_version
-credential_present
+windows sandbox: helper_unknown_error
+setup refresh had errors
 ```
 
-## 状态检查
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json status
-```
-
-检查：
-
-- registry；
-- Provider 是否写入 `config.toml`；
-- API Key 是否存在；
-- Agent TOML 是否一致；
-- 模型目录是否被选中；
-- 新注入模型是否保持 hidden。
-
-## 测试一个 Agent
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json test --role Luna
-```
-
-测试全部：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json test --all
-```
-
-真实测试包括：
-
-```text
-Provider 直连
-    ↓
-native spawn_agent
-    ↓
-等待子线程
-    ↓
-读取 state_*.sqlite
-    ↓
-校验 role / provider / model / reasoning
-```
-
-## 修改 Provider
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json provider-update `
-  --provider relay_a `
-  --base-url "https://new-relay.example.com/v1"
-```
-
-替换 API Key：
-
-```powershell
-$newKey = Read-Host "New API Key"
-$newKey | py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json provider-update `
-  --provider relay_a `
-  --replace-api-key-stdin
-Remove-Variable newKey
-```
-
-## 修改 Agent
-
-换模型：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-update `
-  --role Luna `
-  --model "gpt-5.6-terra"
-```
-
-自动命名的 Agent 会按模型重新推导角色；手工命名的 Agent 会保留自定义名称，除非使用：
-
-```text
---new-role <name>
-```
-
-切换 Provider：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-update `
-  --role Luna `
-  --provider relay_b
-```
-
-## 删除 Agent / Provider
-
-删除 Agent：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json agent-remove --role Luna
-```
-
-删除 Provider：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json provider-remove --provider relay_a
-```
-
-如果 Provider 仍被 Agent 引用，默认拒绝删除。
-
-确认同时删除这些 Agent 时：
-
-```powershell
---cascade
-```
-
-只有明确需要同时删除系统凭据时再加：
-
-```powershell
---remove-credential
-```
-
-## Repair
-
-根据当前 registry 重新生成 Provider block、模型目录和所有 Agent TOML：
-
-```powershell
-py -3 codex-deepseek-subagent\scripts\codex_subagent_manager.py --json repair
-```
-
-## `resume_agent` 注意事项
-
-当前 Codex 的第三方自定义子 Agent 在 `resume_agent` 场景可能恢复历史但丢失原 model/provider/reasoning 配置。
-
-因此仍建议：
-
-```text
-旧子 Agent
-→ compact handoff
-→ fresh spawn 同一 Role
-→ 继续任务
-```
-
-不要把第三方 Agent 的 `resume_agent` 当成可靠主路径，直到 Codex 上游修复并经过真实验收。
-
-## 项目边界
-
-本项目刻意不实现：
-
-- Chat Completions → Responses 协议翻译；
-- Anthropic Messages → Responses；
-- OAuth Provider 聚合；
-- 本地常驻模型代理服务器；
-- 流量统计/托盘程序；
-- 把第三方模型主动暴露到主会话 picker。
-
-这些属于 Codex Router 一类完整路由项目的职责。
-
-本项目保持：
-
-```text
-Responses-compatible Provider
-+
-Native Codex Subagent
-+
-Multi Provider Registry
-+
-Hidden injected models
-```
+不要通过扩大 Agent 权限来隐藏问题。
 
 ## 开发验证
-
-新增回归测试：
-
-```bash
-python3 scripts/test_manager.py
-python3 scripts/test_provider_manager.py
-python3 scripts/test_multi_provider_manager.py
-python3 scripts/test_external_provider_approval_fix.py
-```
-
-Windows：
 
 ```powershell
 py -3 scripts\test_manager.py
 py -3 scripts\test_provider_manager.py
 py -3 scripts\test_multi_provider_manager.py
 py -3 scripts\test_external_provider_approval_fix.py
+py -3 scripts\test_transport_bridge.py
 ```
 
-测试代码已加入仓库；在未实际执行测试的环境中不要声称测试已通过。
+测试代码已经加入仓库。没有实际运行测试的环境不得声称测试已通过。
 
-更详细的运行约束见：
+## 使用当前开发分支
+
+当前 transport bridge / Tool Call probe 等新功能位于：
+
+```text
+agent/custom-provider-support
+```
+
+在这些修改合并到 `main` 之前，必须确保 Codex 实际读取的是这个分支对应的 Skill 文件，而不是仓库默认 `main` 的旧版本。最稳妥的方式是使用本地 checkout 到该分支后的 `codex-deepseek-subagent/` Skill 目录。
+
+详细说明：
 
 ```text
 codex-deepseek-subagent/SKILL.md
+codex-deepseek-subagent/references/transport-and-tool-testing.md
 codex-deepseek-subagent/references/compatibility.md
+codex-deepseek-subagent/references/model-visibility.md
 ```
