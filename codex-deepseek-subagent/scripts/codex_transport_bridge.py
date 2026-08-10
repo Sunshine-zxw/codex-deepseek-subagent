@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Lightweight localhost Responses -> Chat Completions bridge for Codex custom subagents.
 
-The bridge is intentionally narrow: Codex still speaks the Responses wire API,
-while selected providers can use an OpenAI-compatible /chat/completions upstream.
-It preserves tool-call/tool-result history and DeepSeek reasoning_content across
-multi-turn tool execution without introducing Node.js or LiteLLM.
+Codex still speaks the Responses wire API. Providers explicitly configured with
+`chat_completions_bridge` are translated to an OpenAI-compatible
+/chat/completions upstream. Tool calls, tool results, and DeepSeek
+`reasoning_content` are preserved across turns without Node.js or LiteLLM.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from urllib.parse import unquote, urlsplit
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 48671
 REGISTRY_RELATIVE = Path("codex-deepseek-subagent") / "registry.json"
+TRANSPORT_STATE_RELATIVE = Path("codex-deepseek-subagent") / "transport-state.json"
 PID_RELATIVE = Path("codex-deepseek-subagent") / "transport-bridge.pid"
 LOG_RELATIVE = Path("codex-deepseek-subagent") / "transport-bridge.log"
 TRANSPORT = "chat_completions_bridge"
@@ -51,6 +52,10 @@ def registry_path(codex_home: str | None = None) -> Path:
     return resolve_home(codex_home) / REGISTRY_RELATIVE
 
 
+def transport_state_path(codex_home: str | None = None) -> Path:
+    return resolve_home(codex_home) / TRANSPORT_STATE_RELATIVE
+
+
 def pid_path(codex_home: str | None = None) -> Path:
     return resolve_home(codex_home) / PID_RELATIVE
 
@@ -73,25 +78,43 @@ def bridge_port() -> int:
 
 
 def provider_base_url(provider_id: str, port: int | None = None) -> str:
-    safe = urllib.parse.quote(provider_id, safe="") if False else provider_id
-    return f"http://{DEFAULT_HOST}:{port or bridge_port()}/providers/{safe}"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
+        raise BridgeError(500, f"Provider ID 无法用于 bridge 路径：{provider_id}")
+    return f"http://{DEFAULT_HOST}:{port or bridge_port()}/providers/{provider_id}"
 
 
 def health_url(port: int | None = None) -> str:
     return f"http://{DEFAULT_HOST}:{port or bridge_port()}/health"
 
 
+def _load_json(path: Path, missing_ok: bool = False) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if missing_ok:
+            return {}
+        raise
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON 根对象必须是 object：{path}")
+    return payload
+
+
 def _load_registry(codex_home: str | None = None) -> dict[str, Any]:
     path = registry_path(codex_home)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        return _load_json(path)
     except FileNotFoundError as exc:
         raise BridgeError(503, f"registry 不存在：{path}", "registry_missing") from exc
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise BridgeError(500, f"registry 无法读取：{path}", "registry_invalid") from exc
-    if not isinstance(payload, dict):
-        raise BridgeError(500, "registry 根对象无效。", "registry_invalid")
-    return payload
+
+
+def _load_transport_state(codex_home: str | None = None) -> dict[str, Any]:
+    path = transport_state_path(codex_home)
+    try:
+        return _load_json(path, missing_ok=True)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise BridgeError(500, f"transport state 无法读取：{path}", "transport_state_invalid") from exc
 
 
 def provider_for_request(
@@ -100,21 +123,26 @@ def provider_for_request(
     codex_home: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     registry = _load_registry(codex_home)
+    state = _load_transport_state(codex_home)
     providers = registry.get("providers") or {}
     agents = registry.get("agents") or {}
     provider = providers.get(provider_id)
     if not isinstance(provider, dict):
         raise BridgeError(404, f"未知 Provider：{provider_id}", "provider_missing")
-    if provider.get("transport", "responses") != TRANSPORT:
+
+    transport = ((state.get("providers") or {}).get(provider_id) or {}).get("transport", "responses")
+    if transport != TRANSPORT:
         raise BridgeError(400, f"Provider {provider_id} 未配置 {TRANSPORT}。", "transport_mismatch")
 
-    profiles = {
-        str(agent.get("request_profile", "auto"))
-        for agent in agents.values()
-        if isinstance(agent, dict)
-        and agent.get("provider") == provider_id
-        and agent.get("model") == model
-    }
+    agent_profiles = state.get("agents") or {}
+    profiles = set()
+    for role, agent in agents.items():
+        if not isinstance(agent, dict):
+            continue
+        if agent.get("provider") != provider_id or agent.get("model") != model:
+            continue
+        profile_state = agent_profiles.get(role) or {}
+        profiles.add(str(profile_state.get("request_profile", "auto")))
     if len(profiles) > 1:
         raise BridgeError(
             409,
@@ -128,10 +156,7 @@ def provider_for_request(
 def effective_request_profile(model: str, configured: str) -> str:
     if configured != "auto":
         return configured
-    lowered = model.lower()
-    if "deepseek" in lowered:
-        return "deepseek-thinking"
-    return "default"
+    return "deepseek-thinking" if "deepseek" in model.lower() else "default"
 
 
 def _text_from_content(content: Any) -> str:
@@ -195,12 +220,13 @@ def translate_tools(tools: Any) -> tuple[list[dict[str, Any]], dict[str, dict[st
         if not isinstance(tool, dict):
             continue
         kind = str(tool.get("type", "function"))
-        name = str(tool.get("name") or tool.get("function", {}).get("name") or "tool")
+        function_payload = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+        name = str(tool.get("name") or function_payload.get("name") or "tool")
         namespace = tool.get("namespace") if isinstance(tool.get("namespace"), str) else None
         chat_name = _safe_tool_name(namespace, name, used)
         description = tool.get("description")
         if not isinstance(description, str):
-            description = str(tool.get("function", {}).get("description") or "")
+            description = str(function_payload.get("description") or "")
 
         if kind == "custom":
             parameters = {
@@ -217,7 +243,7 @@ def translate_tools(tools: Any) -> tuple[list[dict[str, Any]], dict[str, dict[st
         else:
             parameters = tool.get("parameters")
             if not isinstance(parameters, dict):
-                parameters = tool.get("function", {}).get("parameters")
+                parameters = function_payload.get("parameters")
             if not isinstance(parameters, dict):
                 parameters = {"type": "object", "properties": {}}
 
@@ -230,11 +256,7 @@ def translate_tools(tools: Any) -> tuple[list[dict[str, Any]], dict[str, dict[st
         if isinstance(strict, bool):
             function["strict"] = strict
         result.append({"type": "function", "function": function})
-        mapping[chat_name] = {
-            "kind": kind,
-            "name": name,
-            "namespace": namespace,
-        }
+        mapping[chat_name] = {"kind": kind, "name": name, "namespace": namespace}
     return result, mapping
 
 
@@ -263,8 +285,7 @@ def translate_input(input_value: Any, tool_mapping: dict[str, dict[str, Any]]) -
             continue
         kind = item.get("type")
         if kind == "reasoning":
-            content = item.get("content")
-            reasoning = _text_from_content(content)
+            reasoning = _text_from_content(item.get("content"))
             if reasoning:
                 pending_reasoning = reasoning
             continue
@@ -310,8 +331,7 @@ def translate_input(input_value: Any, tool_mapping: dict[str, dict[str, Any]]) -
                     "content": _tool_output_text(item.get("output")),
                 }
             )
-            continue
-    return coalesce_assistant_messages(ensure_tool_result_order(messages))
+    return ensure_tool_result_order(coalesce_assistant_messages(messages))
 
 
 def coalesce_assistant_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -339,7 +359,7 @@ def coalesce_assistant_messages(messages: list[dict[str, Any]]) -> list[dict[str
 
 
 def ensure_tool_result_order(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop orphan tool rows; preserve valid tool rows immediately after their call."""
+    """Drop orphan tool rows while preserving valid rows directly after their call."""
     result: list[dict[str, Any]] = []
     index = 0
     while index < len(messages):
@@ -368,9 +388,7 @@ def ensure_tool_result_order(messages: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _translate_tool_choice(value: Any, mapping: dict[str, dict[str, Any]]) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, str):
+    if value is None or isinstance(value, str):
         return value
     if not isinstance(value, dict):
         return value
@@ -403,11 +421,7 @@ def responses_to_chat(payload: dict[str, Any], request_profile: str) -> tuple[di
         messages.append({"role": "system", "content": instructions})
     messages.extend(translate_input(payload.get("input"), tool_mapping))
 
-    chat: dict[str, Any] = {
-        "model": payload.get("model"),
-        "messages": messages,
-        "stream": False,
-    }
+    chat: dict[str, Any] = {"model": payload.get("model"), "messages": messages, "stream": False}
     if chat_tools:
         chat["tools"] = chat_tools
     tool_choice = _translate_tool_choice(payload.get("tool_choice"), tool_mapping)
@@ -429,6 +443,8 @@ def responses_to_chat(payload: dict[str, Any], request_profile: str) -> tuple[di
         chat["reasoning_effort"] = deepseek_effort(effort)
         chat.pop("temperature", None)
         chat.pop("top_p", None)
+        # Same compatibility rule as Codex Router: DeepSeek thinking rejects
+        # required/function-object tool_choice, while auto still allows tools.
         if chat.get("tool_choice") not in {None, "none"}:
             chat["tool_choice"] = "auto"
     elif profile == "deepseek-nonthinking":
@@ -493,8 +509,7 @@ def chat_message_to_items(
             item["namespace"] = meta["namespace"]
         items.append(item)
 
-    content = message.get("content")
-    text = _text_from_content(content)
+    text = _text_from_content(message.get("content"))
     if text:
         items.append(
             {
@@ -513,11 +528,13 @@ def _usage_payload(chat_usage: Any) -> dict[str, Any] | None:
     input_tokens = int(chat_usage.get("prompt_tokens") or 0)
     output_tokens = int(chat_usage.get("completion_tokens") or 0)
     total_tokens = int(chat_usage.get("total_tokens") or input_tokens + output_tokens)
+    details = chat_usage.get("completion_tokens_details") or {}
+    reasoning_tokens = int(details.get("reasoning_tokens") or 0) if isinstance(details, dict) else 0
     return {
         "input_tokens": input_tokens,
         "input_tokens_details": {"cached_tokens": 0},
         "output_tokens": output_tokens,
-        "output_tokens_details": {"reasoning_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
         "total_tokens": total_tokens,
     }
 
@@ -542,11 +559,12 @@ def chat_to_responses(chat_payload: dict[str, Any], tool_mapping: dict[str, dict
 
 def response_sse_events(response: dict[str, Any]) -> list[dict[str, Any]]:
     response_id = str(response.get("id") or f"resp_{uuid.uuid4().hex}")
-    created = {
-        "type": "response.created",
-        "response": {"id": response_id, "object": "response", "status": "in_progress"},
-    }
-    events: list[dict[str, Any]] = [created]
+    events: list[dict[str, Any]] = [
+        {
+            "type": "response.created",
+            "response": {"id": response_id, "object": "response", "status": "in_progress"},
+        }
+    ]
     for index, item in enumerate(response.get("output") or []):
         events.append({"type": "response.output_item.added", "output_index": index, "item": item})
         if item.get("type") == "message":
@@ -562,14 +580,18 @@ def response_sse_events(response: dict[str, Any]) -> list[dict[str, Any]]:
                     }
                 )
         events.append({"type": "response.output_item.done", "output_index": index, "item": item})
-    completed_response = {
-        "id": response_id,
-        "object": "response",
-        "status": "completed",
-        "usage": response.get("usage"),
-        "end_turn": True,
-    }
-    events.append({"type": "response.completed", "response": completed_response})
+    events.append(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "usage": response.get("usage"),
+                "end_turn": True,
+            },
+        }
+    )
     return events
 
 
@@ -698,7 +720,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"type": "invalid_request", "message": str(exc)}})
         except BrokenPipeError:
             return
-        except Exception as exc:  # pragma: no cover - last-resort daemon boundary
+        except Exception as exc:  # pragma: no cover
             self._json(500, {"error": {"type": "bridge_internal", "message": f"{type(exc).__name__}: {exc}"}})
 
 
@@ -736,9 +758,14 @@ def ensure_running(codex_home: str | None = None, timeout: float = 6.0) -> dict[
     log.parent.mkdir(parents=True, exist_ok=True)
     handle = open(log, "ab", buffering=0)
     cmd = [sys.executable, str(Path(__file__).resolve()), "serve", "--codex-home", str(home), "--port", str(port)]
-    kwargs: dict[str, Any] = {"stdin": subprocess.DEVNULL, "stdout": handle, "stderr": handle, "close_fds": True}
+    kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": handle,
+        "stderr": handle,
+        "close_fds": True,
+    }
     if os.name == "nt":
-        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        kwargs["creationflags"] = 0x00000008 | 0x00000200
     else:
         kwargs["start_new_session"] = True
     try:
